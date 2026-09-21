@@ -44,9 +44,9 @@ CATEGORIAS_TICKET = {
 
 # Emoji usado em cada tipo (menu, título do embed, etc.)
 EMOJIS_TICKET = {
-    "adquirir": "🛒",
-    "duvidas": "❓",
-    "reotimizar": "🔄",
+    "adquirir": "<:adquirir:1551427917144260609>",
+    "duvidas": "<:duvida:1551427863587069972>",
+    "reotimizar": "<:reotimizar:1551427790534877325>",
 }
 
 HORARIO_ATENDIMENTO = "📅 Segunda a Domingo das 7h às 00h"
@@ -68,14 +68,14 @@ def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
 
     textos = {
         "adquirir": (
-            "🛒 Adquirir Otimização",
+            "<:adquirir:1551427917144260609> Adquirir Otimização",
             discord.Color.gold(),
             "🧑‍💼 **Bem-vindo ao Suporte de Aquisição!**\n\n"
             "Estamos aqui para otimizar sua experiência. Descreve aqui o que pretendes "
             "adquirir e a nossa equipa trata do resto o mais rápido possível.",
         ),
         "duvidas": (
-            "❓ Dúvidas - Suporte Geral",
+            "<:duvida:1551427863587069972> Dúvidas - Suporte Geral",
             discord.Color.blurple(),
             "🧑‍💼 **Bem-vindo ao Suporte de Dúvidas!**\n\n"
             "Estamos aqui para otimizar sua experiência. Se tiver alguma dúvida ou "
@@ -83,7 +83,7 @@ def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
             "especialistas está pronto para fornecer soluções rápidas e eficazes!",
         ),
         "reotimizar": (
-            "🔄 Reotimizar",
+            "<:reotimizar:1551427790534877325> Reotimizar",
             discord.Color.green(),
             "🧑‍💼 **Bem-vindo ao Suporte de Reotimização!**\n\n"
             "Pediste para refazer a tua Otimização Exclusiva. Descreve aqui o pedido e a "
