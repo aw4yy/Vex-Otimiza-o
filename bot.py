@@ -31,11 +31,9 @@ def keep_alive():
 ID_CARGO_MEMBRO = 1550663372272566382
 
 # Cargo da equipa/staff (o "@Equipe" que aparece dentro dos tickets).
-# >>> MUDA ISTO para o ID real do cargo da tua equipa <<<
 ID_CARGO_STAFF = 1550663253032566834
 
 # Uma categoria por tipo de ticket.
-# >>> MUDA ISTO para os IDs reais das categorias no teu servidor <<<
 CATEGORIAS_TICKET = {
     "adquirir": 1551424152622080122,     # categoria para "Adquirir Otimização"
     "duvidas": 1551424186377965618,      # categoria "DÚVIDAS" (a que aparece no print)
@@ -50,12 +48,12 @@ EMOJIS_TICKET = {
 }
 
 HORARIO_ATENDIMENTO = "📅 Segunda a Domingo das 7h às 00h"
- 
+
 # Ficheiro do banner do painel. Tem de estar na mesma pasta do bot.py
 # (ou muda o caminho, ex.: "assets/banner.png")
 BANNER_PATH = "banner.png"
 
-# ========================================================
+# ================= 🛠️ FUNÇÕES AUXILIARES =================
 
 
 def is_staff(member: discord.Member) -> bool:
@@ -112,6 +110,9 @@ def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
     return embed
 
 
+# ================= 🎫 VIEWS: BOTÕES DENTRO DO TICKET =================
+
+
 class TicketOpcoesView(discord.ui.View):
     """Botões que ficam dentro de cada ticket: Finalizar Ticket / Opções."""
 
@@ -146,6 +147,9 @@ class TicketOpcoesView(discord.ui.View):
         await interaction.response.send_message("⚙️ Opções da equipa (por definir).", ephemeral=True)
 
 
+# ================= 📋 PAINEL: MENU DE SELEÇÃO =================
+
+
 class PainelTicketsSelect(discord.ui.Select):
     def __init__(self):
         options = [
@@ -165,7 +169,7 @@ class PainelTicketsSelect(discord.ui.Select):
                 label="Reotimizar",
                 description="Refazer Otimização Exclusiva",
                 value="reotimizar",
-                emoji="<:reotimizar:1551427790534877325>",
+                emoji="<:eng:1551427790534877325>",
             ),
         ]
         super().__init__(
@@ -218,6 +222,9 @@ class PainelTicketsView(discord.ui.View):
         self.add_item(PainelTicketsSelect())
 
 
+# ================= 🤖 CLASSE DO BOT =================
+
+
 class MeuBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -235,6 +242,9 @@ class MeuBot(commands.Bot):
 bot = MeuBot()
 
 
+# ================= ⚡ EVENTOS DO BOT =================
+
+
 @bot.event
 async def on_ready():
     print(f'O bot {bot.user} arrancou e está pronto a usar!')
@@ -247,10 +257,13 @@ async def on_member_join(member):
         await member.add_roles(cargo)
 
 
+# ================= 💬 COMANDOS SLASH =================
+
+
 @bot.tree.command(name="setup_tickets", description="Cria o painel de tickets com o menu de seleção")
 @app_commands.default_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
-    embed = discord.Embed(
+    embed_painel = discord.Embed(
         title="<:Vex:1550695876769489088> Vex Otimização - Ticket's",
         description=(
             "Selecione abaixo a opção que melhor atende à sua necessidade e abra seu "
@@ -259,7 +272,25 @@ async def setup_tickets(interaction: discord.Interaction):
         ),
         color=discord.Color.dark_theme(),
     )
-    await interaction.channel.send(embed=embed, view=PainelTicketsView())
+
+    embeds = []
+    ficheiros = []
+
+    # Banner largo por cima: vai num embed próprio, sem título nem descrição,
+    # enviado ANTES do embed do painel — assim aparece visualmente em cima.
+    if os.path.isfile(BANNER_PATH):
+        ficheiro_banner = discord.File(BANNER_PATH, filename="banner.png")
+        embed_banner = discord.Embed(color=discord.Color.dark_theme())
+        embed_banner.set_image(url="attachment://banner.png")
+        embeds.append(embed_banner)
+        ficheiros.append(ficheiro_banner)
+    else:
+        # Se isto aparecer nos logs do Render, o ficheiro não está onde o bot está à espera dele.
+        print(f"AVISO: não encontrei o ficheiro do banner em '{BANNER_PATH}'.")
+
+    embeds.append(embed_painel)
+
+    await interaction.channel.send(embeds=embeds, files=ficheiros, view=PainelTicketsView())
     await interaction.response.send_message("Painel de tickets criado!", ephemeral=True)
 
 
@@ -269,6 +300,8 @@ async def aviso(interaction: discord.Interaction, mensagem: str):
     await interaction.channel.send(mensagem)
     await interaction.response.send_message("Aviso enviado com sucesso!", ephemeral=True)
 
+
+# ================= 🚀 INICIAR O BOT =================
 
 if __name__ == '__main__':
     keep_alive()
