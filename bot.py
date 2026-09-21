@@ -46,7 +46,7 @@ CATEGORIAS_TICKET = {
 EMOJIS_TICKET = {
     "adquirir": "<:adquirir:1551427917144260609>",
     "duvidas": "<:duvida:1551427863587069972>",
-    "reotimizar": "<:reotimizar:1551427790534877325>",
+    "reotimizar": "<:eng:1551427790534877325>",
 }
 
 HORARIO_ATENDIMENTO = "📅 Segunda a Domingo das 7h às 00h"
@@ -83,7 +83,7 @@ def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
             "especialistas está pronto para fornecer soluções rápidas e eficazes!",
         ),
         "reotimizar": (
-            "<:reotimizar:1551427790534877325> Reotimizar",
+            "<:eng:1551427790534877325> Reotimizar",
             discord.Color.green(),
             "🧑‍💼 **Bem-vindo ao Suporte de Reotimização!**\n\n"
             "Pediste para refazer a tua Otimização Exclusiva. Descreve aqui o pedido e a "
