@@ -1,5 +1,7 @@
 import os
+import asyncio
 import threading
+
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -8,36 +10,209 @@ from flask import Flask
 # ================= CONFIGURAÇÕES DO SERVIDOR WEB (RENDER) =================
 app = Flask('')
 
+
 @app.route('/')
 def home():
     return "O bot está online e a funcionar 24/7!"
+
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
+
 def keep_alive():
     t = threading.Thread(target=run_web_server)
     t.start()
 
+
 # ================= CONFIGURAÇÕES DO BOT =================
+# Cargo dado automaticamente a quem entra no servidor
 ID_CARGO_MEMBRO = 1550663372272566382
-ID_CATEGORIA_TICKETS = 1550661876528971826
+
+# Cargo da equipa/staff (o "@Equipe" que aparece dentro dos tickets).
+# >>> MUDA ISTO para o ID real do cargo da tua equipa <<<
+ID_CARGO_STAFF = 1550663253032566834
+
+# Uma categoria por tipo de ticket.
+# >>> MUDA ISTO para os IDs reais das categorias no teu servidor <<<
+CATEGORIAS_TICKET = {
+    "adquirir": 1551424152622080122,     # categoria para "Adquirir Otimização"
+    "duvidas": 1551424186377965618,      # categoria "DÚVIDAS" (a que aparece no print)
+    "reotimizar": 1551424281513304164,   # categoria para "Reotimizar"
+}
+
+# Emoji usado em cada tipo (menu, título do embed, etc.)
+EMOJIS_TICKET = {
+    "adquirir": "🛒",
+    "duvidas": "❓",
+    "reotimizar": "🔄",
+}
+
+HORARIO_ATENDIMENTO = "📅 Segunda a Domingo das 7h às 00h"
+
 # ========================================================
 
-class TicketButton(discord.ui.View):
+
+def is_staff(member: discord.Member) -> bool:
+    """Verifica se quem interagiu é da equipa (ou admin)."""
+    if member.guild_permissions.administrator:
+        return True
+    cargo_staff = member.guild.get_role(ID_CARGO_STAFF)
+    return cargo_staff is not None and cargo_staff in member.roles
+
+
+def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
+    """Cria o embed de boas-vindas de cada tipo de ticket (igual ao layout do print)."""
+    emoji = EMOJIS_TICKET.get(tipo, "🎫")
+
+    textos = {
+        "adquirir": (
+            "🛒 Adquirir Otimização",
+            discord.Color.gold(),
+            "🧑‍💼 **Bem-vindo ao Suporte de Aquisição!**\n\n"
+            "Estamos aqui para otimizar sua experiência. Descreve aqui o que pretendes "
+            "adquirir e a nossa equipa trata do resto o mais rápido possível.",
+        ),
+        "duvidas": (
+            "❓ Dúvidas - Suporte Geral",
+            discord.Color.blurple(),
+            "🧑‍💼 **Bem-vindo ao Suporte de Dúvidas!**\n\n"
+            "Estamos aqui para otimizar sua experiência. Se tiver alguma dúvida ou "
+            "precisar de assistência, fique à vontade para perguntar. Nosso time de "
+            "especialistas está pronto para fornecer soluções rápidas e eficazes!",
+        ),
+        "reotimizar": (
+            "🔄 Reotimizar",
+            discord.Color.green(),
+            "🧑‍💼 **Bem-vindo ao Suporte de Reotimização!**\n\n"
+            "Pediste para refazer a tua Otimização Exclusiva. Descreve aqui o pedido e a "
+            "nossa equipa vai analisar e tratar disso o mais rápido possível.",
+        ),
+    }
+
+    titulo, cor, descricao = textos.get(tipo, (f"{emoji} Ticket", discord.Color.dark_theme(), ""))
+
+    embed = discord.Embed(title=titulo, description=descricao, color=cor)
+    embed.add_field(name="🧑‍💼 Horário de Atendimento", value=HORARIO_ATENDIMENTO, inline=False)
+    embed.add_field(
+        name="\u200b",
+        value=(
+            "🧑‍💼 Durante o horário de atendimento, nossa equipe estará **100% disponível** "
+            "para te ajudar com dúvidas, solicitações e suporte!"
+        ),
+        inline=False,
+    )
+    embed.set_author(name=f"Ticket de {autor.name}", icon_url=autor.display_avatar.url)
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+
+class TicketOpcoesView(discord.ui.View):
+    """Botões que ficam dentro de cada ticket: Finalizar Ticket / Opções."""
+
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Abrir Ticket", style=discord.ButtonStyle.primary, custom_id="abrir_ticket_btn")
-    async def ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        categoria = discord.utils.get(interaction.guild.categories, id=ID_CATEGORIA_TICKETS)
-        canal = await interaction.guild.create_text_channel(f"ticket-{interaction.user.name}", category=categoria)
-        
-        await canal.set_permissions(interaction.guild.default_role, read_messages=False)
-        await canal.set_permissions(interaction.user, read_messages=True, send_messages=True)
-        
+    @discord.ui.button(
+        label="Finalizar Ticket",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+        custom_id="ticket_finalizar_btn",
+    )
+    async def finalizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Ticket será encerrado em alguns segundos...")
+        await asyncio.sleep(3)
+        await interaction.channel.delete()
+
+    @discord.ui.button(
+        label="Opções",
+        emoji="⚙️",
+        style=discord.ButtonStyle.primary,
+        custom_id="ticket_opcoes_btn",
+    )
+    async def opcoes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("🚫 Apenas responsáveis.", ephemeral=True)
+            return
+
+        # A equipa chega até aqui. Ainda não vi nenhum print do menu real da equipa,
+        # por isso deixo aqui um placeholder simples — troca pelo que precisares
+        # (ex.: adicionar/remover membro do ticket, reivindicar ticket, renomear, etc.)
+        await interaction.response.send_message("⚙️ Opções da equipa (por definir).", ephemeral=True)
+
+
+class PainelTicketsSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label="Adquirir Otimização",
+                description="Garanta sua Otimização",
+                value="adquirir",
+                emoji="🛒",
+            ),
+            discord.SelectOption(
+                label="Dúvidas",
+                description="Suporte geral",
+                value="duvidas",
+                emoji="❓",
+            ),
+            discord.SelectOption(
+                label="Reotimizar",
+                description="Refazer Otimização Exclusiva",
+                value="reotimizar",
+                emoji="🔄",
+            ),
+        ]
+        super().__init__(
+            placeholder="Selecione o atendimento que melhor atende à sua necessidade...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="painel_tickets_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        tipo = self.values[0]
+        guild = interaction.guild
+
+        categoria_id = CATEGORIAS_TICKET.get(tipo)
+        categoria = discord.utils.get(guild.categories, id=categoria_id) if categoria_id else None
+
+        nome_canal = f"{interaction.user.name}-{tipo}".lower()
+
+        # Evita abrir dois tickets do mesmo tipo para a mesma pessoa
+        existente = discord.utils.get(guild.text_channels, name=nome_canal)
+        if existente:
+            await interaction.response.send_message(
+                f"Já tens um ticket aberto: {existente.mention}", ephemeral=True
+            )
+            return
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        }
+        cargo_staff = guild.get_role(ID_CARGO_STAFF)
+        if cargo_staff:
+            overwrites[cargo_staff] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+        canal = await guild.create_text_channel(nome_canal, category=categoria, overwrites=overwrites)
+
+        mencoes = interaction.user.mention
+        if cargo_staff:
+            mencoes += f" | {cargo_staff.mention}"
+
+        embed = montar_embed_ticket(tipo, interaction.user)
+        await canal.send(content=mencoes, embed=embed, view=TicketOpcoesView())
         await interaction.response.send_message(f"O teu ticket foi criado aqui: {canal.mention}", ephemeral=True)
+
+
+class PainelTicketsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(PainelTicketsSelect())
+
 
 class MeuBot(commands.Bot):
     def __init__(self):
@@ -47,14 +222,19 @@ class MeuBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        self.add_view(TicketButton())
+        # Views persistentes: continuam a funcionar mesmo depois do bot reiniciar
+        self.add_view(PainelTicketsView())
+        self.add_view(TicketOpcoesView())
         await self.tree.sync()
 
+
 bot = MeuBot()
+
 
 @bot.event
 async def on_ready():
     print(f'O bot {bot.user} arrancou e está pronto a usar!')
+
 
 @bot.event
 async def on_member_join(member):
@@ -62,11 +242,22 @@ async def on_member_join(member):
     if cargo:
         await member.add_roles(cargo)
 
-@bot.tree.command(name="setup_tickets", description="Cria a mensagem com o botão de tickets")
+
+@bot.tree.command(name="setup_tickets", description="Cria o painel de tickets com o menu de seleção")
 @app_commands.default_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
-    await interaction.channel.send("Tens alguma dúvida ou precisas de ajuda? Clica no botão abaixo para abrir um ticket.", view=TicketButton())
+    embed = discord.Embed(
+        title="<:Vex:1550695876769489088> Vex Otimização - Ticket's",
+        description=(
+            "Selecione abaixo a opção que melhor atende à sua necessidade e abra seu "
+            "ticket para receber um suporte adequado e personalizado. Assim, poderemos "
+            "te ajudar da melhor forma possível."
+        ),
+        color=discord.Color.dark_theme(),
+    )
+    await interaction.channel.send(embed=embed, view=PainelTicketsView())
     await interaction.response.send_message("Painel de tickets criado!", ephemeral=True)
+
 
 @bot.tree.command(name="aviso", description="Envia uma mensagem para o canal atual usando o bot")
 @app_commands.default_permissions(administrator=True)
@@ -74,10 +265,10 @@ async def aviso(interaction: discord.Interaction, mensagem: str):
     await interaction.channel.send(mensagem)
     await interaction.response.send_message("Aviso enviado com sucesso!", ephemeral=True)
 
+
 if __name__ == '__main__':
     keep_alive()
     TOKEN = os.getenv('DISCORD_TOKEN')
-    
     if not TOKEN:
         print("ERRO: A variável de ambiente 'DISCORD_TOKEN' não foi encontrada!")
     else:
