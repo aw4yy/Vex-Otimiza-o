@@ -50,6 +50,10 @@ EMOJIS_TICKET = {
 }
 
 HORARIO_ATENDIMENTO = "📅 Segunda a Domingo das 7h às 00h"
+ 
+# Ficheiro do banner do painel. Tem de estar na mesma pasta do bot.py
+# (ou muda o caminho, ex.: "assets/banner.png")
+BANNER_PATH = "banner.png"
 
 # ========================================================
 
