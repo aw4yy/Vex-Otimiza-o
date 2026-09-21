@@ -149,19 +149,19 @@ class PainelTicketsSelect(discord.ui.Select):
                 label="Adquirir Otimização",
                 description="Garanta sua Otimização",
                 value="adquirir",
-                emoji="🛒",
+                emoji="<:adquirir:1551427917144260609>",
             ),
             discord.SelectOption(
                 label="Dúvidas",
                 description="Suporte geral",
                 value="duvidas",
-                emoji="❓",
+                emoji="<:duvida:1551427863587069972>",
             ),
             discord.SelectOption(
                 label="Reotimizar",
                 description="Refazer Otimização Exclusiva",
                 value="reotimizar",
-                emoji="🔄",
+                emoji="<:reotimizar:1551427790534877325>",
             ),
         ]
         super().__init__(
