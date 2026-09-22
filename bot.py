@@ -17,30 +17,27 @@ def home():
 
 
 def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
+    # O Render usa obrigatoriamente a variável de ambiente PORT (por defeito 10000)
+    port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 
 def keep_alive():
     t = threading.Thread(target=run_web_server)
+    t.daemon = True
     t.start()
 
 
 # ================= CONFIGURAÇÕES DO BOT =================
-# Cargo dado automaticamente a quem entra no servidor
 ID_CARGO_MEMBRO = 1550663372272566382
-
-# Cargo da equipa/staff (o "@Equipe" que aparece dentro dos tickets).
 ID_CARGO_STAFF = 1550663253032566834
 
-# Uma categoria por tipo de ticket.
 CATEGORIAS_TICKET = {
-    "adquirir": 1551424152622080122,     # categoria para "Adquirir Otimização"
-    "duvidas": 1551424186377965618,      # categoria "DÚVIDAS" (a que aparece no print)
-    "reotimizar": 1551424281513304164,   # categoria para "Reotimizar"
+    "adquirir": 1551424152622080122,
+    "duvidas": 1551424186377965618,
+    "reotimizar": 1551424281513304164,
 }
 
-# Emoji usado em cada tipo (menu, título do embed, etc.)
 EMOJIS_TICKET = {
     "adquirir": "<:adquirir:1551427917144260609>",
     "duvidas": "<:duvida:1551427863587069972>",
@@ -48,16 +45,12 @@ EMOJIS_TICKET = {
 }
 
 HORARIO_ATENDIMENTO = "📅 Segunda a Domingo das 7h às 00h"
-
-# Ficheiro do banner do painel. Tem de estar na mesma pasta do bot.py
-# (ou muda o caminho, ex.: "assets/banner.png")
 BANNER_PATH = "banner.png"
 
 # ================= 🛠️ FUNÇÕES AUXILIARES =================
 
 
 def is_staff(member: discord.Member) -> bool:
-    """Verifica se quem interagiu é da equipa (ou admin)."""
     if member.guild_permissions.administrator:
         return True
     cargo_staff = member.guild.get_role(ID_CARGO_STAFF)
@@ -65,7 +58,6 @@ def is_staff(member: discord.Member) -> bool:
 
 
 def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
-    """Cria o embed de boas-vindas de cada tipo de ticket (igual ao layout do print)."""
     emoji = EMOJIS_TICKET.get(tipo, "🎫")
 
     textos = {
@@ -114,8 +106,6 @@ def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
 
 
 class TicketOpcoesView(discord.ui.View):
-    """Botões que ficam dentro de cada ticket: Finalizar Ticket / Opções."""
-
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -140,10 +130,6 @@ class TicketOpcoesView(discord.ui.View):
         if not is_staff(interaction.user):
             await interaction.response.send_message("🚫 Apenas responsáveis.", ephemeral=True)
             return
-
-        # A equipa chega até aqui. Ainda não vi nenhum print do menu real da equipa,
-        # por isso deixo aqui um placeholder simples — troca pelo que precisares
-        # (ex.: adicionar/remover membro do ticket, reivindicar ticket, renomear, etc.)
         await interaction.response.send_message("⚙️ Opções da equipa (por definir).", ephemeral=True)
 
 
@@ -181,9 +167,6 @@ class PainelTicketsSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        # Avisa logo o Discord que vamos tratar disto — sem isto, criar o canal
-        # e configurar permissões pode facilmente passar dos 3 segundos permitidos
-        # e o Discord mostra "O aplicativo não respondeu a tempo".
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         tipo = self.values[0]
@@ -194,7 +177,6 @@ class PainelTicketsSelect(discord.ui.Select):
 
         nome_canal = f"{interaction.user.name}-{tipo}".lower()
 
-        # Evita abrir dois tickets do mesmo tipo para a mesma pessoa
         existente = discord.utils.get(guild.text_channels, name=nome_canal)
         if existente:
             await interaction.followup.send(
@@ -250,7 +232,6 @@ class MeuBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # Views persistentes: continuam a funcionar mesmo depois do bot reiniciar
         self.add_view(PainelTicketsView())
         self.add_view(TicketOpcoesView())
         await self.tree.sync()
@@ -292,26 +273,22 @@ async def setup_tickets(interaction: discord.Interaction):
         color=discord.Color.dark_theme(),
     )
 
-    embeds = []
     ficheiros = []
 
-    # Banner largo por cima: vai num embed próprio, sem título nem descrição,
-    # enviado ANTES do embed do painel — assim aparece visualmente em cima.
     if os.path.isfile(BANNER_PATH):
         ficheiro_banner = discord.File(BANNER_PATH, filename="banner.png")
-        embed_banner = discord.Embed(color=discord.Color.dark_theme())
-        embed_banner.set_image(url="attachment://banner.png")
-        embeds.append(embed_banner)
+        embed_painel.set_image(url="attachment://banner.png")
         ficheiros.append(ficheiro_banner)
     else:
-        # Se isto aparecer nos logs do Render, o ficheiro não está onde o bot está à espera dele.
         print(f"AVISO: não encontrei o ficheiro do banner em '{BANNER_PATH}'.")
 
-    embeds.append(embed_painel)
-
     try:
-        await interaction.channel.send(embeds=embeds, files=ficheiros, view=PainelTicketsView())
-        await interaction.followup.send("Painel de tickets criado!", ephemeral=True)
+        if ficheiros:
+            await interaction.channel.send(embed=embed_painel, files=ficheiros, view=PainelTicketsView())
+        else:
+            await interaction.channel.send(embed=embed_painel, view=PainelTicketsView())
+            
+        await interaction.followup.send("Painel de tickets criado com sucesso!", ephemeral=True)
     except discord.Forbidden:
         print("Erro ao criar painel: falta permissão para enviar mensagens/anexos neste canal.")
         await interaction.followup.send(
