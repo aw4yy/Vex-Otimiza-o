@@ -181,6 +181,11 @@ class PainelTicketsSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        # Avisa logo o Discord que vamos tratar disto — sem isto, criar o canal
+        # e configurar permissões pode facilmente passar dos 3 segundos permitidos
+        # e o Discord mostra "O aplicativo não respondeu a tempo".
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         tipo = self.values[0]
         guild = interaction.guild
 
@@ -192,28 +197,40 @@ class PainelTicketsSelect(discord.ui.Select):
         # Evita abrir dois tickets do mesmo tipo para a mesma pessoa
         existente = discord.utils.get(guild.text_channels, name=nome_canal)
         if existente:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Já tens um ticket aberto: {existente.mention}", ephemeral=True
             )
             return
 
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-        }
-        cargo_staff = guild.get_role(ID_CARGO_STAFF)
-        if cargo_staff:
-            overwrites[cargo_staff] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        try:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            }
+            cargo_staff = guild.get_role(ID_CARGO_STAFF)
+            if cargo_staff:
+                overwrites[cargo_staff] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
-        canal = await guild.create_text_channel(nome_canal, category=categoria, overwrites=overwrites)
+            canal = await guild.create_text_channel(nome_canal, category=categoria, overwrites=overwrites)
 
-        mencoes = interaction.user.mention
-        if cargo_staff:
-            mencoes += f" | {cargo_staff.mention}"
+            mencoes = interaction.user.mention
+            if cargo_staff:
+                mencoes += f" | {cargo_staff.mention}"
 
-        embed = montar_embed_ticket(tipo, interaction.user)
-        await canal.send(content=mencoes, embed=embed, view=TicketOpcoesView())
-        await interaction.response.send_message(f"O teu ticket foi criado aqui: {canal.mention}", ephemeral=True)
+            embed = montar_embed_ticket(tipo, interaction.user)
+            await canal.send(content=mencoes, embed=embed, view=TicketOpcoesView())
+            await interaction.followup.send(f"O teu ticket foi criado aqui: {canal.mention}", ephemeral=True)
+        except discord.Forbidden:
+            print("Erro ao criar ticket: falta permissão (Manage Channels / Manage Roles) para o cargo do bot.")
+            await interaction.followup.send(
+                "⚠️ Não tenho permissões suficientes para criar o canal do ticket. Avisa a equipa.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            print(f"Erro ao criar ticket: {e!r}")
+            await interaction.followup.send(
+                "⚠️ Ocorreu um erro ao criar o ticket. Avisa a equipa.", ephemeral=True
+            )
 
 
 class PainelTicketsView(discord.ui.View):
@@ -263,6 +280,8 @@ async def on_member_join(member):
 @bot.tree.command(name="setup_tickets", description="Cria o painel de tickets com o menu de seleção")
 @app_commands.default_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     embed_painel = discord.Embed(
         title="<:Vex:1550695876769489088> Vex Otimização - Ticket's",
         description=(
@@ -290,8 +309,17 @@ async def setup_tickets(interaction: discord.Interaction):
 
     embeds.append(embed_painel)
 
-    await interaction.channel.send(embeds=embeds, files=ficheiros, view=PainelTicketsView())
-    await interaction.response.send_message("Painel de tickets criado!", ephemeral=True)
+    try:
+        await interaction.channel.send(embeds=embeds, files=ficheiros, view=PainelTicketsView())
+        await interaction.followup.send("Painel de tickets criado!", ephemeral=True)
+    except discord.Forbidden:
+        print("Erro ao criar painel: falta permissão para enviar mensagens/anexos neste canal.")
+        await interaction.followup.send(
+            "⚠️ Não tenho permissão para enviar mensagens/anexos neste canal.", ephemeral=True
+        )
+    except Exception as e:
+        print(f"Erro ao criar painel: {e!r}")
+        await interaction.followup.send("⚠️ Ocorreu um erro ao criar o painel.", ephemeral=True)
 
 
 @bot.tree.command(name="aviso", description="Envia uma mensagem para o canal atual usando o bot")
