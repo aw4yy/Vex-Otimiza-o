@@ -10,10 +10,10 @@ from discord.ext import commands
 from discord import app_commands
 from flask import Flask, request, redirect
 
-# ================= 🌐 CONFIGURAÇÕES WEB & FLASK (PRIMEIRO) =================
+# ================= 🌐 CONFIGURAÇÕES WEB & FLASK (PRIMEIRO) ================
 app = Flask(__name__)
 
-# ================= 🗄️ BASE DE DADOS PERSISTENTE (SQLITE) =================
+# ================= 🗄️ BASE DE DADOS PERSISTENTE (SQLITE) ================
 DATA_PATH = os.getenv("DATA_PATH")
 if DATA_PATH and os.path.exists(DATA_PATH):
     DB_FILE = os.path.join(DATA_PATH, "auth_tokens.db")
