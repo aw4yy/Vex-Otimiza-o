@@ -398,6 +398,7 @@ bot = MeuBot()
 async def on_ready():
     print(f'O bot {bot.user} arrancou e está pronto a usar!')
 
+# ================= 💬 COMANDOS SLASH =================
 @bot.tree.command(name="setup_tickets", description="Cria o painel de tickets")
 @app_commands.default_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
@@ -414,6 +415,12 @@ async def setup_tickets(interaction: discord.Interaction):
     else:
         await interaction.channel.send(embed=embed_painel, view=PainelTicketsView())
     await interaction.followup.send("Painel criado!", ephemeral=True)
+
+@bot.tree.command(name="aviso", description="Envia uma mensagem para o canal atual usando o bot")
+@app_commands.default_permissions(administrator=True)
+async def aviso(interaction: discord.Interaction, mensagem: str):
+    await interaction.channel.send(mensagem)
+    await interaction.response.send_message("Aviso enviado com sucesso!", ephemeral=True)
 
 @bot.tree.command(name="setup_verify", description="Cria a mensagem de verificação (OAuth2)")
 @app_commands.default_permissions(administrator=True)
@@ -452,6 +459,41 @@ async def pull_all(interaction: discord.Interaction):
         await asyncio.sleep(1)
 
     await interaction.followup.send(f"📊 **Resultado:** Sucessos: {sucessos} | Já no Servidor: {ja_no_servidor} | Falhas: {falhas}", ephemeral=True)
+
+@bot.tree.command(name="pull_user", description="Puxa um utilizador específico pelo seu ID")
+@app_commands.default_permissions(administrator=True)
+async def pull_user(interaction: discord.Interaction, user_id: str):
+    await interaction.response.defer(ephemeral=True)
+    row = get_user_token(user_id)
+    if not row:
+        await interaction.followup.send("⚠️ Este utilizador não se encontra na base de dados.", ephemeral=True)
+        return
+
+    _, access_token, refresh_token, expires_at = row
+    if time.time() >= expires_at:
+        access_token = refresh_access_token(user_id, refresh_token)
+        if not access_token:
+            await interaction.followup.send("❌ O token expirou e não foi possível renová-lo.", ephemeral=True)
+            return
+
+    bot_token = os.getenv("DISCORD_TOKEN")
+    status = add_user_to_guild(access_token, interaction.guild_id, user_id, bot_token)
+
+    if status in (201, 200):
+        await interaction.followup.send(f"✅ Utilizador `{user_id}` adicionado com sucesso!", ephemeral=True)
+    elif status == 204:
+        await interaction.followup.send(f"ℹ️ O utilizador `{user_id}` já está neste servidor.", ephemeral=True)
+    else:
+        await interaction.followup.send(f"❌ Falha ao adicionar (Código API: {status}).", ephemeral=True)
+
+@bot.tree.command(name="auth_stats", description="Mostra o número total de utilizadores autorizados na DB")
+@app_commands.default_permissions(administrator=True)
+async def auth_stats(interaction: discord.Interaction):
+    tokens = get_all_tokens()
+    await interaction.response.send_message(
+        f"📈 **Estatísticas de Autorização:**\nTotal de membros autorizados na DB: `{len(tokens)}`", 
+        ephemeral=True
+    )
 
 if __name__ == '__main__':
     keep_alive()
