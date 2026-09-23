@@ -4,13 +4,19 @@ import threading
 import sqlite3
 import requests
 import time
+import urllib.parse
 import discord
 from discord.ext import commands
 from discord import app_commands
 from flask import Flask, request, redirect
 
-# ================= 🗄️ BASE DE DADOS (SQLITE) =================
-DB_FILE = "auth_tokens.db"
+# ================= 🗄️ BASE DE DADOS PERSISTENTE (SQLITE) =================
+# Se a variável DATA_PATH existir (Volume do Railway), guarda lá a DB para não perder dados.
+DATA_PATH = os.getenv("DATA_PATH")
+if DATA_PATH and os.path.exists(DATA_PATH):
+    DB_FILE = os.path.join(DATA_PATH, "auth_tokens.db")
+else:
+    DB_FILE = "auth_tokens.db"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -62,40 +68,36 @@ def get_user_token(user_id: str):
 # ================= 🌐 CONFIGURAÇÕES OAUTH2 & WEB SERVER =================
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI") # Ex: https://teu-dominio.up.railway.app/callback
+REDIRECT_URI = os.getenv("REDIRECT_URI") # Ex: https://vex-otimiza-o-production.up.railway.app/callback
 
-app = Flask('')
+def get_discord_auth_url():
+    if not CLIENT_ID or not REDIRECT_URI:
+        return "https://discord.com"
+    redirect_encoded = urllib.parse.quote(REDIRECT_URI, safe='')
+    return f"https://discord.com/oauth2/authorize?client_id={CLIENT_ID}&response_type=code&redirect_uri={redirect_encoded}&scope=guilds.join%20identify"
+
+app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "O bot e o sistema de Verificação (Auth) estão online e operacionais 24/7!"
+    return "O bot e o servidor Auth estão online e operacionais 24/7!"
 
 @app.route('/auth')
 def auth():
     if not CLIENT_ID or not REDIRECT_URI:
-        return "Erro interno: CLIENT_ID ou REDIRECT_URI não estão configurados no Railway.", 500
-    
-    discord_auth_url = (
-        f"https://discord.com/api/oauth2/authorize"
-        f"?client_id={CLIENT_ID}"
-        f"&redirect_uri={REDIRECT_URI}"
-        f"&response_type=code"
-        f"&scope=identify%20guilds.join"
-    )
-    return redirect(discord_auth_url)
+        return "Erro interno: CLIENT_ID ou REDIRECT_URI não definidos no Railway.", 500
+    return redirect(get_discord_auth_url())
 
 @app.route('/callback')
 def callback():
-    # Se o utilizador clicar em "Cancelar" no Discord
     error = request.args.get('error')
     if error:
-        return f"Autorização cancelada ou falhou. Motivo: {error}", 400
+        return f"Autorização cancelada ou recusada. Motivo: {error}", 400
 
     code = request.args.get('code')
     if not code:
         return "Erro: Código de autorização não fornecido.", 400
 
-    # 1. Trocar o código pelo token
     token_url = "https://discord.com/api/oauth2/token"
     payload = {
         'client_id': CLIENT_ID,
@@ -108,32 +110,31 @@ def callback():
     
     response = requests.post(token_url, data=payload, headers=headers)
     if response.status_code != 200:
-        return f"Erro ao obter token do Discord. Verifica as credenciais no Railway.", 400
+        return f"Erro ao obter token do Discord: {response.text}", 400
 
     token_data = response.json()
     access_token = token_data['access_token']
     refresh_token = token_data['refresh_token']
     expires_in = token_data['expires_in']
 
-    # 2. Obter o ID do utilizador usando o access_token
+    # Obter dados do utilizador
     user_info_url = "https://discord.com/api/users/@me"
     user_headers = {'Authorization': f"Bearer {access_token}"}
     user_response = requests.get(user_info_url, headers=user_headers)
     
     if user_response.status_code != 200:
-        return "Erro ao ler o ID da tua conta do Discord.", 400
+        return "Erro ao obter informações do perfil de utilizador.", 400
 
     user_data = user_response.json()
     user_id = user_data['id']
 
-    # 3. Guardar na base de dados
     save_user_tokens(user_id, access_token, refresh_token, expires_in)
 
     return """
-    <div style="text-align: center; font-family: Arial, sans-serif; margin-top: 100px;">
+    <div style="text-align: center; font-family: Arial, sans-serif; margin-top: 80px;">
         <h1 style="color: #43b581;">✅ Verificação Concluída!</h1>
         <p style="font-size: 18px; color: #fff; background-color: #36393f; padding: 20px; border-radius: 8px; display: inline-block;">
-            A tua conta foi verificada com sucesso. Já podes fechar esta página e voltar ao Discord.
+            A tua conta foi autorizada com sucesso. Já podes fechar esta janela e voltar ao Discord.
         </p>
     </div>
     <style>body { background-color: #2f3136; color: white; }</style>
@@ -148,7 +149,7 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# ================= 🔄 AUXILIAR DE REFRESH & PULL =================
+# ================= 🔄 REFRESH & PULL DE MEMBROS =================
 def refresh_access_token(user_id: str, refresh_token: str):
     token_url = "https://discord.com/api/oauth2/token"
     payload = {
@@ -198,6 +199,7 @@ EMOJIS_TICKET = {
 HORARIO_ATENDIMENTO = "📅 Segunda a Domingo das 7h às 00h"
 BANNER_PATH = "banner.png"
 
+# ================= 🛠️ FUNÇÕES AUXILIARES =================
 def is_staff(member: discord.Member) -> bool:
     if member.guild_permissions.administrator:
         return True
@@ -210,45 +212,98 @@ def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
         "adquirir": (
             "<:adquirir:1551427917144260609> Adquirir Otimização",
             discord.Color.gold(),
-            "🧑‍💼 **Bem-vindo ao Suporte de Aquisição!**\n\nEstamos aqui para otimizar a sua experiência. Descreve o que pretendes adquirir.",
+            "🧑‍💼 **Bem-vindo ao Suporte de Aquisição!**\n\n"
+            "Estamos aqui para otimizar sua experiência. Descreve aqui o que pretendes "
+            "adquirir e a nossa equipa trata do resto o mais rápido possível.",
         ),
         "duvidas": (
             "<:duvida:1551427863587069972> Dúvidas - Suporte Geral",
             discord.Color.blurple(),
-            "🧑‍💼 **Bem-vindo ao Suporte de Dúvidas!**\n\nSe tiver alguma dúvida ou precisar de assistência, fique à vontade para perguntar.",
+            "🧑‍💼 **Bem-vindo ao Suporte de Dúvidas!**\n\n"
+            "Estamos aqui para otimizar sua experiência. Se tiver alguma dúvida ou "
+            "precisar de assistência, fique à vontade para perguntar. Nosso time de "
+            "especialistas está pronto para fornecer soluções rápidas e eficazes!",
         ),
         "reotimizar": (
             "<:eng:1551427790534877325> Reotimizar",
             discord.Color.green(),
-            "🧑‍💼 **Bem-vindo ao Suporte de Reotimização!**\n\nPediste para refazer a tua Otimização Exclusiva. Descreve o teu pedido.",
+            "🧑‍💼 **Bem-vindo ao Suporte de Reotimização!**\n\n"
+            "Pediste para refazer a tua Otimização Exclusiva. Descreve aqui o pedido e a "
+            "nossa equipa vai analisar e tratar disso o mais rápido possível.",
         ),
     }
     titulo, cor, descricao = textos.get(tipo, (f"{emoji} Ticket", discord.Color.dark_theme(), ""))
     embed = discord.Embed(title=titulo, description=descricao, color=cor)
     embed.add_field(name="🧑‍💼 Horário de Atendimento", value=HORARIO_ATENDIMENTO, inline=False)
+    embed.add_field(
+        name="\u200b",
+        value=(
+            "🧑‍💼 Durante o horário de atendimento, nossa equipe estará **100% disponível** "
+            "para te ajudar com dúvidas, solicitações e suporte!"
+        ),
+        inline=False,
+    )
     embed.set_author(name=f"Ticket de {autor.name}", icon_url=autor.display_avatar.url)
     embed.timestamp = discord.utils.utcnow()
     return embed
 
-# ================= 🎫 VIEWS =================
+# ================= 🎫 VIEWS: TICKETS & VERIFY =================
 class TicketOpcoesView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Finalizar Ticket", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="ticket_finalizar_btn")
+    @discord.ui.button(
+        label="Finalizar Ticket",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+        custom_id="ticket_finalizar_btn",
+    )
     async def finalizar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("Ticket será encerrado em 3 segundos...")
+        await interaction.response.send_message("Ticket será encerrado em alguns segundos...")
         await asyncio.sleep(3)
         await interaction.channel.delete()
+
+    @discord.ui.button(
+        label="Opções",
+        emoji="⚙️",
+        style=discord.ButtonStyle.primary,
+        custom_id="ticket_opcoes_btn",
+    )
+    async def opcoes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("🚫 Apenas responsáveis.", ephemeral=True)
+            return
+        await interaction.response.send_message("⚙️ Opções da equipa (por definir).", ephemeral=True)
 
 class PainelTicketsSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="Adquirir Otimização", value="adquirir", emoji="<:adquirir:1551427917144260609>"),
-            discord.SelectOption(label="Dúvidas", value="duvidas", emoji="<:duvida:1551427863587069972>"),
-            discord.SelectOption(label="Reotimizar", value="reotimizar", emoji="<:eng:1551427790534877325>"),
+            discord.SelectOption(
+                label="Adquirir Otimização",
+                description="Garanta sua Otimização",
+                value="adquirir",
+                emoji="<:adquirir:1551427917144260609>",
+            ),
+            discord.SelectOption(
+                label="Dúvidas",
+                description="Suporte geral",
+                value="duvidas",
+                emoji="<:duvida:1551427863587069972>",
+            ),
+            discord.SelectOption(
+                label="Reotimizar",
+                description="Refazer Otimização Exclusiva",
+                value="reotimizar",
+                emoji="<:eng:1551427790534877325>",
+            ),
         ]
-        super().__init__(placeholder="Selecione o atendimento...", min_values=1, max_values=1, options=options, custom_id="painel_tickets_select")
+        super().__init__(
+            placeholder="Selecione o atendimento que melhor atende à sua necessidade...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="painel_tickets_select",
+        )
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -260,7 +315,10 @@ class PainelTicketsSelect(discord.ui.Select):
         existente = discord.utils.get(guild.text_channels, name=nome_canal)
 
         if existente:
-            return await interaction.followup.send(f"Já tens um ticket aberto: {existente.mention}", ephemeral=True)
+            await interaction.followup.send(
+                f"Já tens um ticket aberto: {existente.mention}", ephemeral=True
+            )
+            return
 
         try:
             overwrites = {
@@ -272,12 +330,23 @@ class PainelTicketsSelect(discord.ui.Select):
                 overwrites[cargo_staff] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
             canal = await guild.create_text_channel(nome_canal, category=categoria, overwrites=overwrites)
-            mencoes = interaction.user.mention + (f" | {cargo_staff.mention}" if cargo_staff else "")
-            
-            await canal.send(content=mencoes, embed=montar_embed_ticket(tipo, interaction.user), view=TicketOpcoesView())
+            mencoes = interaction.user.mention
+            if cargo_staff:
+                mencoes += f" | {cargo_staff.mention}"
+
+            embed = montar_embed_ticket(tipo, interaction.user)
+            await canal.send(content=mencoes, embed=embed, view=TicketOpcoesView())
             await interaction.followup.send(f"O teu ticket foi criado aqui: {canal.mention}", ephemeral=True)
+
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "⚠️ Não tenho permissões suficientes para criar o canal do ticket. Avisa a equipa.",
+                ephemeral=True,
+            )
         except Exception as e:
-            await interaction.followup.send("⚠️ Erro ao criar ticket. Verifica as permissões.", ephemeral=True)
+            await interaction.followup.send(
+                "⚠️ Ocorreu um erro ao criar o ticket. Avisa a equipa.", ephemeral=True
+            )
 
 class PainelTicketsView(discord.ui.View):
     def __init__(self):
@@ -287,11 +356,14 @@ class PainelTicketsView(discord.ui.View):
 class VerifyAuthView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        # Tenta pegar o link direto para /auth
-        auth_url = REDIRECT_URI.replace("/callback", "/auth") if REDIRECT_URI else "https://discord.com"
-        self.add_item(discord.ui.Button(label="Verificar Conta", url=auth_url, style=discord.ButtonStyle.link, emoji="✅"))
+        self.add_item(discord.ui.Button(
+            label="Verificar Conta",
+            url=get_discord_auth_url(),
+            style=discord.ButtonStyle.link,
+            emoji="✅"
+        ))
 
-# ================= 🤖 INÍCIO BOT =================
+# ================= 🤖 CLASSE DO BOT =================
 class MeuBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -303,62 +375,88 @@ class MeuBot(commands.Bot):
         self.add_view(PainelTicketsView())
         self.add_view(TicketOpcoesView())
         self.add_view(VerifyAuthView())
-        await self.tree.sync()
+        synced = await self.tree.sync()
+        print(f"Sincronizados {len(synced)} comandos Slash com sucesso!")
 
 bot = MeuBot()
 
+# ================= ⚡ EVENTOS DO BOT =================
 @bot.event
 async def on_ready():
-    print(f'O bot {bot.user} arrancou e está pronto!')
+    print(f'O bot {bot.user} arrancou e está pronto a usar!')
 
 @bot.event
 async def on_member_join(member):
     cargo = member.guild.get_role(ID_CARGO_MEMBRO)
     if cargo:
-        try: await member.add_roles(cargo)
-        except: pass
+        try:
+            await member.add_roles(cargo)
+        except Exception as e:
+            print(f"Erro ao dar cargo a novo membro: {e}")
 
 # ================= 💬 COMANDOS SLASH =================
-@bot.tree.command(name="setup_tickets", description="Cria o painel de tickets")
+@bot.tree.command(name="setup_tickets", description="Cria o painel de tickets com o menu de seleção")
 @app_commands.default_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
     embed_painel = discord.Embed(
         title="<:Vex:1550695876769489088> Vex Otimização - Ticket's",
-        description="Selecione abaixo a opção que melhor atende à sua necessidade.",
+        description=(
+            "Selecione abaixo a opção que melhor atende à sua necessidade e abra seu "
+            "ticket para receber um suporte adequado e personalizado. Assim, poderemos "
+            "te ajudar da melhor forma possível."
+        ),
         color=discord.Color.dark_theme(),
     )
     ficheiros = []
     if os.path.isfile(BANNER_PATH):
-        ficheiros.append(discord.File(BANNER_PATH, filename="banner.png"))
+        ficheiro_banner = discord.File(BANNER_PATH, filename="banner.png")
         embed_painel.set_image(url="attachment://banner.png")
-    
-    await interaction.channel.send(embed=embed_painel, files=ficheiros, view=PainelTicketsView())
-    await interaction.followup.send("Painel de tickets criado!", ephemeral=True)
+        ficheiros.append(ficheiro_banner)
+
+    try:
+        if ficheiros:
+            await interaction.channel.send(embed=embed_painel, files=ficheiros, view=PainelTicketsView())
+        else:
+            await interaction.channel.send(embed=embed_painel, view=PainelTicketsView())
+            
+        await interaction.followup.send("Painel de tickets criado com sucesso!", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Ocorreu um erro ao criar o painel: {e}", ephemeral=True)
+
+@bot.tree.command(name="aviso", description="Envia uma mensagem para o canal atual usando o bot")
+@app_commands.default_permissions(administrator=True)
+async def aviso(interaction: discord.Interaction, mensagem: str):
+    await interaction.channel.send(mensagem)
+    await interaction.response.send_message("Aviso enviado com sucesso!", ephemeral=True)
 
 @bot.tree.command(name="setup_verify", description="Cria a mensagem de verificação (OAuth2)")
 @app_commands.default_permissions(administrator=True)
 async def setup_verify(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🔒 Verificação de Segurança",
-        description="Clica no botão abaixo para te **verificares** e teres acesso ao servidor.\n\nSerás redirecionado para autorizar a aplicação (isto permite-nos restaurar o teu acesso futuramente).",
+        description=(
+            "Para teres acesso aos canais do servidor, clica no botão abaixo para te **verificares**.\n\n"
+            "Ao clicares, serás redirecionado para autorizar a aplicação e validar o teu acesso."
+        ),
         color=discord.Color.green()
     )
     await interaction.channel.send(embed=embed, view=VerifyAuthView())
     await interaction.response.send_message("Painel de verificação enviado!", ephemeral=True)
 
-@bot.tree.command(name="pull_all", description="Puxa todos os membros autorizados (DB) para este servidor")
+@bot.tree.command(name="pull_all", description="Puxa todos os membros autorizados da DB para este servidor")
 @app_commands.default_permissions(administrator=True)
 async def pull_all(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     tokens = get_all_tokens()
-    
     if not tokens:
-        return await interaction.followup.send("Ninguém na base de dados.", ephemeral=True)
+        await interaction.followup.send("Nenhum utilizador registado na base de dados.", ephemeral=True)
+        return
 
-    sucessos, ja_estava, falhas = 0, 0, 0
+    sucessos, ja_no_servidor, falhas = 0, 0, 0
     bot_token = os.getenv("DISCORD_TOKEN")
-    
+    guild_id = interaction.guild_id
+
     for user_id, access_token, refresh_token, expires_at in tokens:
         if time.time() >= expires_at:
             access_token = refresh_access_token(user_id, refresh_token)
@@ -366,48 +464,66 @@ async def pull_all(interaction: discord.Interaction):
                 falhas += 1
                 continue
 
-        status = add_user_to_guild(access_token, interaction.guild_id, user_id, bot_token)
+        status = add_user_to_guild(access_token, guild_id, user_id, bot_token)
         
-        if status in (201, 200): sucessos += 1
-        elif status == 204: ja_estava += 1
-        else: falhas += 1
-        await asyncio.sleep(1) # Previne block da API
+        if status in (201, 200):
+            sucessos += 1
+        elif status == 204:
+            ja_no_servidor += 1
+        else:
+            falhas += 1
+            
+        await asyncio.sleep(1) # Prevenir rate limits da API
 
-    embed = discord.Embed(title="📊 Resultado do Pull", color=discord.Color.blue())
-    embed.add_field(name="Adicionados", value=str(sucessos))
-    embed.add_field(name="Já no Servidor", value=str(ja_estava))
-    embed.add_field(name="Falharam", value=str(falhas))
+    embed = discord.Embed(title="📊 Resultado do Pull de Membros", color=discord.Color.blue())
+    embed.add_field(name="Adicionados com Sucesso", value=str(sucessos), inline=True)
+    embed.add_field(name="Já no Servidor", value=str(ja_no_servidor), inline=True)
+    embed.add_field(name="Falhas / Tokens Expirados", value=str(falhas), inline=True)
+
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="pull_user", description="Puxa um membro específico pelo ID")
+@bot.tree.command(name="pull_user", description="Puxa um utilizador específico pelo seu ID")
 @app_commands.default_permissions(administrator=True)
-async def pull_user(interaction: discord.Interaction, id_utilizador: str):
+async def pull_user(interaction: discord.Interaction, user_id: str):
     await interaction.response.defer(ephemeral=True)
-    row = get_user_token(id_utilizador)
     
+    row = get_user_token(user_id)
     if not row:
-        return await interaction.followup.send("⚠️ Este utilizador não autorizou o bot.", ephemeral=True)
+        await interaction.followup.send("⚠️ Este utilizador não se encontra na base de dados de autorizados.", ephemeral=True)
+        return
 
     _, access_token, refresh_token, expires_at = row
+    
     if time.time() >= expires_at:
-        access_token = refresh_access_token(id_utilizador, refresh_token)
+        access_token = refresh_access_token(user_id, refresh_token)
         if not access_token:
-            return await interaction.followup.send("❌ Token expirou e não pôde ser renovado.", ephemeral=True)
+            await interaction.followup.send("❌ O token do utilizador expirou e não foi possível renová-lo.", ephemeral=True)
+            return
 
-    status = add_user_to_guild(access_token, interaction.guild_id, id_utilizador, os.getenv("DISCORD_TOKEN"))
-    if status in (201, 200): await interaction.followup.send(f"✅ Utilizador `{id_utilizador}` adicionado!", ephemeral=True)
-    elif status == 204: await interaction.followup.send(f"ℹ️ O utilizador já está no servidor.", ephemeral=True)
-    else: await interaction.followup.send(f"❌ Falha ao adicionar (Erro API: {status}).", ephemeral=True)
+    bot_token = os.getenv("DISCORD_TOKEN")
+    status = add_user_to_guild(access_token, interaction.guild_id, user_id, bot_token)
 
-@bot.tree.command(name="auth_stats", description="Mostra quantos utilizadores verificados tens na DB")
+    if status in (201, 200):
+        await interaction.followup.send(f"✅ Utilizador `{user_id}` adicionado ao servidor com sucesso!", ephemeral=True)
+    elif status == 204:
+        await interaction.followup.send(f"ℹ️ O utilizador `{user_id}` já se encontra neste servidor.", ephemeral=True)
+    else:
+        await interaction.followup.send(f"❌ Falha ao adicionar utilizador (Código API: {status}).", ephemeral=True)
+
+@bot.tree.command(name="auth_stats", description="Mostra o número total de utilizadores autorizados na DB")
 @app_commands.default_permissions(administrator=True)
 async def auth_stats(interaction: discord.Interaction):
-    await interaction.response.send_message(f"📈 **Membros na Base de Dados:** `{len(get_all_tokens())}`", ephemeral=True)
+    tokens = get_all_tokens()
+    await interaction.response.send_message(
+        f"📈 **Estatísticas de Autorização:**\nTotal de membros autorizados na DB: `{len(tokens)}`", 
+        ephemeral=True
+    )
 
-# ================= 🚀 START =================
+# ================= 🚀 INICIAR O BOT =================
 if __name__ == '__main__':
     keep_alive()
-    if not os.getenv('DISCORD_TOKEN'):
-        print("ERRO: Falta a variável 'DISCORD_TOKEN'")
+    TOKEN = os.getenv('DISCORD_TOKEN')
+    if not TOKEN:
+        print("ERRO: A variável de ambiente 'DISCORD_TOKEN' não foi encontrada!")
     else:
-        bot.run(os.getenv('DISCORD_TOKEN'))
+        bot.run(TOKEN)
