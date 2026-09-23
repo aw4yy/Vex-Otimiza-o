@@ -11,7 +11,6 @@ from discord import app_commands
 from flask import Flask, request, redirect
 
 # ================= 🗄️ BASE DE DADOS PERSISTENTE (SQLITE) =================
-# Se a variável DATA_PATH existir (Volume do Railway), guarda lá a DB para não perder dados.
 DATA_PATH = os.getenv("DATA_PATH")
 if DATA_PATH and os.path.exists(DATA_PATH):
     DB_FILE = os.path.join(DATA_PATH, "auth_tokens.db")
@@ -117,7 +116,7 @@ def callback():
     refresh_token = token_data['refresh_token']
     expires_in = token_data['expires_in']
 
-    # Obter dados do utilizador
+    # Obter ID do utilizador
     user_info_url = "https://discord.com/api/users/@me"
     user_headers = {'Authorization': f"Bearer {access_token}"}
     user_response = requests.get(user_info_url, headers=user_headers)
@@ -128,13 +127,31 @@ def callback():
     user_data = user_response.json()
     user_id = user_data['id']
 
+    # 1. Guardar tokens na DB
     save_user_tokens(user_id, access_token, refresh_token, expires_in)
+
+    # 2. Atribuir automaticamente o cargo de Membro no Discord
+    try:
+        bot_token = os.getenv("DISCORD_TOKEN")
+        guild_id = os.getenv("GUILD_ID")
+        
+        # Se GUILD_ID não estiver no Railway, tenta usar o servidor onde o bot está
+        if not guild_id and bot.guilds:
+            guild_id = str(bot.guilds[0].id)
+            
+        if guild_id and bot_token:
+            role_url = f"https://discord.com/api/v10/guilds/{guild_id}/members/{user_id}/roles/{ID_CARGO_MEMBRO}"
+            role_headers = {"Authorization": f"Bot {bot_token}"}
+            res = requests.put(role_url, headers=role_headers)
+            print(f"Atribuição do cargo {ID_CARGO_MEMBRO} ao utilizador {user_id}: Status {res.status_code}")
+    except Exception as e:
+        print(f"Erro ao atribuir cargo no callback: {e}")
 
     return """
     <div style="text-align: center; font-family: Arial, sans-serif; margin-top: 80px;">
         <h1 style="color: #43b581;">✅ Verificação Concluída!</h1>
         <p style="font-size: 18px; color: #fff; background-color: #36393f; padding: 20px; border-radius: 8px; display: inline-block;">
-            A tua conta foi autorizada com sucesso. Já podes fechar esta janela e voltar ao Discord.
+            A tua conta foi autorizada e o teu acesso ao servidor foi libertado. Já podes fechar esta janela e voltar ao Discord.
         </p>
     </div>
     <style>body { background-color: #2f3136; color: white; }</style>
@@ -247,7 +264,7 @@ def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
     embed.timestamp = discord.utils.utcnow()
     return embed
 
-# ================= 🎫 VIEWS: TICKETS & VERIFY =================
+# ================= 🎫 VIEWS =================
 class TicketOpcoesView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -387,12 +404,8 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member):
-    cargo = member.guild.get_role(ID_CARGO_MEMBRO)
-    if cargo:
-        try:
-            await member.add_roles(cargo)
-        except Exception as e:
-            print(f"Erro ao dar cargo a novo membro: {e}")
+    # O utilizador entra sem cargo para apenas ver o canal de verificação.
+    pass
 
 # ================= 💬 COMANDOS SLASH =================
 @bot.tree.command(name="setup_tickets", description="Cria o painel de tickets com o menu de seleção")
@@ -473,7 +486,7 @@ async def pull_all(interaction: discord.Interaction):
         else:
             falhas += 1
             
-        await asyncio.sleep(1) # Prevenir rate limits da API
+        await asyncio.sleep(1) # Prevenir rate limits
 
     embed = discord.Embed(title="📊 Resultado do Pull de Membros", color=discord.Color.blue())
     embed.add_field(name="Adicionados com Sucesso", value=str(sucessos), inline=True)
