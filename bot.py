@@ -147,14 +147,246 @@ def callback():
     except Exception as e:
         print(f"Erro ao atribuir cargo no callback: {e}")
 
-    return """
-    <div style="text-align: center; font-family: Arial, sans-serif; margin-top: 80px;">
-        <h1 style="color: #43b581;">✅ Verificação Concluída!</h1>
-        <p style="font-size: 18px; color: #fff; background-color: #36393f; padding: 20px; border-radius: 8px; display: inline-block;">
-            A tua conta foi autorizada e o teu acesso ao servidor foi libertado. Já podes fechar esta janela e voltar ao Discord.
-        </p>
-    </div>
-    <style>body { background-color: #2f3136; color: white; }</style>
+    data_hora_atual = time.strftime("%d/%m/%Y, %H:%M")
+
+    # 🎨 HTML DA PÁGINA WEB COM FUNDO ANIMADO EM MOVIMENTO
+    return f"""
+    <!DOCTYPE html>
+    <html lang="pt">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Verificação Concluída - Vex Otimização</title>
+        <style>
+            * {{
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }}
+            
+            body {{
+                background: linear-gradient(-45deg, #090a0f, #121520, #08090d, #1a1228);
+                background-size: 400% 400%;
+                animation: animateBackground 12s ease infinite;
+                color: #ffffff;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+                padding: 20px;
+                overflow: hidden;
+                position: relative;
+            }}
+
+            @keyframes animateBackground {{
+                0% {{ background-position: 0% 50%; }}
+                50% {{ background-position: 100% 50%; }}
+                100% {{ background-position: 0% 50%; }}
+            }}
+
+            .glow-1, .glow-2 {{
+                position: absolute;
+                width: 350px;
+                height: 350px;
+                border-radius: 50%;
+                filter: blur(100px);
+                opacity: 0.25;
+                z-index: 0;
+                animation: floatGlow 10s ease-in-out infinite alternate;
+            }}
+            .glow-1 {{
+                background: #5865f2;
+                top: 15%;
+                left: 20%;
+            }}
+            .glow-2 {{
+                background: #23a55a;
+                bottom: 15%;
+                right: 20%;
+                animation-delay: -5s;
+            }}
+
+            @keyframes floatGlow {{
+                0% {{ transform: translate(0, 0) scale(1); }}
+                100% {{ transform: translate(40px, -50px) scale(1.3); }}
+            }}
+
+            .card {{
+                position: relative;
+                z-index: 1;
+                background: rgba(20, 21, 26, 0.85);
+                backdrop-filter: blur(16px);
+                -webkit-backdrop-filter: blur(16px);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 20px;
+                width: 100%;
+                max-width: 400px;
+                overflow: hidden;
+                box-shadow: 0 20px 50px rgba(0, 0, 0, 0.8);
+                text-align: center;
+            }}
+
+            .banner {{
+                width: 100%;
+                height: 120px;
+                background: linear-gradient(135deg, #1f2235 0%, #0d0e14 100%);
+                background-size: cover;
+                background-position: center;
+            }}
+
+            .avatar-container {{
+                position: relative;
+                display: inline-block;
+                margin-top: -34px;
+                margin-bottom: 12px;
+            }}
+
+            .avatar {{
+                width: 68px;
+                height: 68px;
+                border-radius: 50%;
+                border: 4px solid #14151a;
+                background: linear-gradient(135deg, #2b2d42, #181924);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-weight: 800;
+                font-size: 18px;
+                color: #fff;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            }}
+
+            .badge {{
+                position: absolute;
+                bottom: 2px;
+                right: 2px;
+                background-color: #23a55a;
+                color: white;
+                border-radius: 50%;
+                width: 22px;
+                height: 22px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 12px;
+                border: 3px solid #14151a;
+            }}
+
+            .content {{
+                padding: 0 24px 26px 24px;
+            }}
+
+            .title {{
+                font-size: 20px;
+                font-weight: 700;
+                color: #ffffff;
+                margin-bottom: 6px;
+            }}
+
+            .timestamp {{
+                font-size: 12px;
+                color: #72767d;
+                margin-bottom: 16px;
+            }}
+
+            .description {{
+                font-size: 13px;
+                color: #96989d;
+                line-height: 1.5;
+                margin-bottom: 20px;
+            }}
+
+            .server-box {{
+                background: rgba(255, 255, 255, 0.03);
+                border: 1px solid rgba(255, 255, 255, 0.06);
+                border-radius: 12px;
+                padding: 12px 14px;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                margin-bottom: 20px;
+            }}
+
+            .server-info {{
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }}
+
+            .server-icon {{
+                width: 36px;
+                height: 36px;
+                border-radius: 10px;
+                background: #2b2d42;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-weight: bold;
+                font-size: 12px;
+            }}
+
+            .server-name {{
+                font-size: 13px;
+                font-weight: 600;
+                color: #ffffff;
+                text-align: left;
+            }}
+
+            .verified-tag {{
+                font-size: 12px;
+                color: #23a55a;
+                font-weight: 600;
+            }}
+
+            .btn {{
+                display: block;
+                width: 100%;
+                padding: 13px;
+                background: rgba(255, 255, 255, 0.08);
+                color: #ffffff;
+                text-decoration: none;
+                font-weight: 600;
+                font-size: 13px;
+                border-radius: 10px;
+                transition: all 0.2s ease;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+            }}
+
+            .btn:hover {{
+                background: rgba(255, 255, 255, 0.15);
+                transform: translateY(-2px);
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="glow-1"></div>
+        <div class="glow-2"></div>
+
+        <div class="card">
+            <div class="banner"></div>
+            <div class="avatar-container">
+                <div class="avatar">VEX</div>
+                <div class="badge">✓</div>
+            </div>
+            <div class="content">
+                <h1 class="title">Verificação concluída</h1>
+                <div class="timestamp">{data_hora_atual}</div>
+                <p class="description">
+                    Sua identidade foi confirmada com segurança e vinculada ao servidor <strong>Vex Otimização</strong>. O cargo de acesso já foi processado.
+                </p>
+                <div class="server-box">
+                    <div class="server-info">
+                        <div class="server-icon">VEX</div>
+                        <div class="server-name">Vex Otimização</div>
+                    </div>
+                    <div class="verified-tag">✓ Verified</div>
+                </div>
+                <a href="discord://" class="btn">Acessar servidor</a>
+            </div>
+        </div>
+    </body>
+    </html>
     """
 
 def run_web_server():
