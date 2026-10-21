@@ -301,10 +301,7 @@ HORARIO_ATENDIMENTO = "📅 Segunda a Domingo das 7h às 00h"
 BANNER_PATH = "banner.png"
 
 # ================= 🔊 CANAL DE VOZ 24/7 =================
-# ID do canal de voz onde queres o bot sempre ligado.
-# Ativa o "Modo de Programador" nas tuas Definições do Discord (Avançado),
-# depois clica com o botão direito no canal de voz e escolhe "Copiar ID do Canal".
-ID_CANAL_VOZ_24_7 = 0  # <-- MUDA para o ID real do teu canal de voz
+ID_CANAL_VOZ_24_7 = 1550659976005947412
 
 def is_staff(member: discord.Member) -> bool:
     if member.guild_permissions.administrator:
