@@ -300,6 +300,12 @@ EMOJIS_TICKET = {
 HORARIO_ATENDIMENTO = "📅 Segunda a Domingo das 7h às 00h"
 BANNER_PATH = "banner.png"
 
+# ================= 🔊 CANAL DE VOZ 24/7 =================
+# ID do canal de voz onde queres o bot sempre ligado.
+# Ativa o "Modo de Programador" nas tuas Definições do Discord (Avançado),
+# depois clica com o botão direito no canal de voz e escolhe "Copiar ID do Canal".
+ID_CANAL_VOZ_24_7 = 0  # <-- MUDA para o ID real do teu canal de voz
+
 def is_staff(member: discord.Member) -> bool:
     if member.guild_permissions.administrator:
         return True
@@ -319,6 +325,29 @@ def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
     embed.set_author(name=f"Ticket de {autor.name}", icon_url=autor.display_avatar.url)
     embed.timestamp = discord.utils.utcnow()
     return embed
+
+# ================= 🔊 FUNÇÃO DA CHAMADA 24/7 =================
+
+
+async def entrar_na_chamada_247():
+    """Liga o bot ao canal de voz configurado, se ainda não estiver lá."""
+    if not ID_CANAL_VOZ_24_7:
+        return
+
+    canal = bot.get_channel(ID_CANAL_VOZ_24_7)
+    if canal is None:
+        print("AVISO: não encontrei o canal de voz configurado em ID_CANAL_VOZ_24_7.")
+        return
+
+    if canal.guild.voice_client is not None:
+        return  # já está ligado
+
+    try:
+        await canal.connect(reconnect=True, self_deaf=True)
+        print(f"Entrei na chamada 24/7: {canal.name}")
+    except Exception as e:
+        print(f"Erro ao entrar na chamada 24/7: {e!r}")
+
 
 class TicketOpcoesView(discord.ui.View):
     def __init__(self):
@@ -397,6 +426,17 @@ bot = MeuBot()
 @bot.event
 async def on_ready():
     print(f'O bot {bot.user} arrancou e está pronto a usar!')
+    await entrar_na_chamada_247()
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # Se o próprio bot saiu da chamada 24/7 sem ser por um comando nosso
+    # (alguém expulsou-o, falha de rede, etc.), tenta voltar a entrar sozinho.
+    if member.id == bot.user.id and before.channel is not None and after.channel is None:
+        await asyncio.sleep(5)
+        await entrar_na_chamada_247()
+
 
 # ================= 💬 COMANDOS SLASH =================
 @bot.tree.command(name="setup_tickets", description="Cria o painel de tickets")
