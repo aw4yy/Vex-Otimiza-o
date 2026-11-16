@@ -522,7 +522,7 @@ async def abrir_ticket(interaction: discord.Interaction, tipo: str, respostas=()
     async with ticket_create_lock:
         canal = None
         try:
-            canais = await guild.fetch_channels()
+            canais = guild.text_channels
             existente = next((
                 item for item in canais if isinstance(item, discord.TextChannel) and (
                     item.topic == topic or (
