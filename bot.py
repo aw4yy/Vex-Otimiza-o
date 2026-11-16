@@ -682,8 +682,9 @@ async def setup_verify(interaction: discord.Interaction):
         description="Clica no botão abaixo para te **verificares** e obteres acesso ao servidor.",
         color=discord.Color.green()
     )
-    await interaction.channel.send(embed=embed, view=VerifyAuthView())
-    await interaction.response.send_message("Painel de verificação enviado!", ephemeral=True)
+     await interaction.response.defer(ephemeral=True, thinking=True)
+ await interaction.channel.send(embed=embed, view=VerifyAuthView())
+ await interaction.followup.send("Painel de verificação enviado!", ephemeral=True)
 
 # ── Gestão de membros autorizados ──
 # Adiciona membros com autorização guardada e mostra as estatísticas de verificação.
