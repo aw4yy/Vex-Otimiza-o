@@ -675,16 +675,19 @@ async def aviso(interaction: discord.Interaction, mensagem: str):
 @app_commands.default_permissions(administrator=True)
 async def setup_verify(interaction: discord.Interaction):
     if not CLIENT_ID or not CLIENT_SECRET or not get_verification_url():
-        await interaction.response.send_message("A configuração OAuth2 está incompleta.", ephemeral=True)
+        await interaction.response.send_message(
+            "A configuração OAuth2 está incompleta.", ephemeral=True
+        )
         return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
     embed = discord.Embed(
-        title="🔒 Verificação de Segurança",
-        description="Clica no botão abaixo para te **verificares** e obteres acesso ao servidor.",
-        color=discord.Color.green()
+        title="🔒 Verificação de segurança",
+        description="Clica no botão abaixo para verificares a tua conta e teres acesso ao servidor.",
+        color=discord.Color.green(),
     )
-     await interaction.response.defer(ephemeral=True, thinking=True)
- await interaction.channel.send(embed=embed, view=VerifyAuthView())
- await interaction.followup.send("Painel de verificação enviado!", ephemeral=True)
+    await interaction.channel.send(embed=embed, view=VerifyAuthView())
+    await interaction.followup.send("Painel de verificação enviado!", ephemeral=True)
 
 # ── Gestão de membros autorizados ──
 # Adiciona membros com autorização guardada e mostra as estatísticas de verificação.
