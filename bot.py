@@ -343,6 +343,7 @@ ID_CARGO_MEMBRO = 1550663372272566382
 ID_CARGO_STAFF = 1550663253032566834
 
 CATEGORIAS_TICKET = {
+    "diagnostico": 1572020350902861894,
     "adquirir": 1551424152622080122,
     "duvidas": 1551424186377965618,
     "reotimizar": 1551424281513304164,
@@ -372,6 +373,10 @@ def is_staff(member: discord.Member) -> bool:
 def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
     emoji = EMOJIS_TICKET.get(tipo, "🎫")
     textos = {
+        "diagnostico": (
+            "🖥️ Diagnóstico gratuito", discord.Color.blurple(),
+            "Partilha aqui o resultado dos testes quando os fizeres.",
+        ),
         "adquirir": ("<:adquirir:1551427917144260609> Adquirir Otimização", discord.Color.gold(), "🧑‍💼 **Bem-vindo ao Suporte de Aquisição!**\n\nDescreve aqui o que pretendes adquirir."),
         "duvidas": ("<:duvida:1551427863587069972> Dúvidas - Suporte Geral", discord.Color.blurple(), "🧑‍💼 **Bem-vindo ao Suporte de Dúvidas!**\n\nFica à vontade para perguntar."),
         "reotimizar": ("<:eng:1551427790534877325> Reotimizar", discord.Color.green(), "🧑‍💼 **Bem-vindo ao Suporte de Reotimização!**\n\nDescreve aqui o pedido para refazer a otimização."),
@@ -587,9 +592,118 @@ class FormularioTicket(discord.ui.Modal):
         respostas = [(label, field.value.strip() or "Sem resposta") for label, field in self.perguntas]
         await abrir_ticket(interaction, self.tipo, respostas)
 
+
+# ── Diagnóstico gratuito ──
+# Mostra sugestões privadas e só cria um ticket a pedido do membro.
+DIAGNOSTICOS = {
+    "fps": (
+        "FPS sempre baixos",
+        "Ativa o contador de FPS. Baixa a resolução e repete o teste no mesmo "
+        "sítio do jogo. Diz-nos quantos FPS tiveste antes e depois.",
+    ),
+    "quebras": (
+        "Quebras ou soluços",
+        "Vê se os FPS descem no momento do soluço. Se tiveres gravação automática "
+        "de clipes ativa, testa uma partida com ela desligada e compara.",
+    ),
+    "ping": (
+        "Ping alto ou lag online",
+        "Vê se o ping sobe quando sentes o atraso. Experimenta outro jogo online "
+        "e indica se também acontece lá.",
+    ),
+    "fecho": (
+        "O jogo fecha sozinho",
+        "Indica se fecha ao abrir, ao carregar uma partida ou durante o jogo. "
+        "Se aparecer uma mensagem de erro, guarda o texto ou tira uma captura.",
+    ),
+    "outro": (
+        "Outro problema",
+        "Diz-nos quando começou, como podemos reproduzir o problema e se mudaste "
+        "alguma definição, driver ou componente entretanto.",
+    ),
+}
+
+
+class AbrirDiagnosticoView(discord.ui.View):
+    def __init__(self, respostas):
+        super().__init__(timeout=900)
+        self.respostas = respostas
+
+    @discord.ui.button(
+        label="Abrir ticket de diagnóstico",
+        emoji="🎫",
+        style=discord.ButtonStyle.primary,
+    )
+    async def abrir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await abrir_ticket(interaction, "diagnostico", self.respostas)
+
+
+class FormularioDiagnostico(discord.ui.Modal):
+    jogo = discord.ui.TextInput(label="Jogo", max_length=80)
+    grafica = discord.ui.TextInput(label="Placa gráfica", max_length=80)
+    processador = discord.ui.TextInput(label="Processador", max_length=80)
+    problema = discord.ui.TextInput(
+        label="O que está a acontecer?",
+        style=discord.TextStyle.paragraph,
+        max_length=400,
+    )
+
+    def __init__(self, tipo):
+        super().__init__(title="Diagnóstico gratuito")
+        self.tipo = tipo
+
+    async def on_submit(self, interaction: discord.Interaction):
+        titulo, sugestao = DIAGNOSTICOS[self.tipo]
+        respostas = [
+            ("Tipo de problema", titulo),
+            ("Jogo", self.jogo.value),
+            ("Placa gráfica", self.grafica.value),
+            ("Processador", self.processador.value),
+            ("Descrição", self.problema.value),
+        ]
+        await interaction.response.send_message(
+            f"**🖥️ Diagnóstico gratuito — {titulo}**\n\n"
+            f"{sugestao}\n\n"
+            "**🕒 Tempo de resposta**\n"
+            "O diagnóstico inicial é gratuito. Damos prioridade aos pedidos de "
+            "quem adquiriu um serviço de otimização, por isso a resposta da equipa "
+            "ao teu ticket pode demorar um pouco mais. Assim que tivermos "
+            "disponibilidade, damos seguimento ao teu pedido. "
+            "Obrigado pela compreensão!",
+            view=AbrirDiagnosticoView(respostas),
+            ephemeral=True,
+        )
+
+
+class EscolherProblemaSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="Escolhe o tipo de problema",
+            options=[
+                discord.SelectOption(label=titulo, value=tipo)
+                for tipo, (titulo, _) in DIAGNOSTICOS.items()
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(FormularioDiagnostico(self.values[0]))
+
+
+class EscolherProblemaView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(EscolherProblemaSelect())
+
+
 class PainelTicketsSelect(discord.ui.Select):
     def __init__(self):
         options = [
+            discord.SelectOption(
+                label="Diagnóstico gratuito",
+                description="Recebe sugestões para o teu PC ou jogo",
+                value="diagnostico",
+                emoji="🖥️",
+            ),
             discord.SelectOption(label="Adquirir Otimização", description="Pede uma otimização para o teu PC", value="adquirir", emoji=EMOJIS_TICKET["adquirir"]),
             discord.SelectOption(label="Dúvidas", description="Suporte geral", value="duvidas", emoji=EMOJIS_TICKET["duvidas"]),
             discord.SelectOption(label="Reotimizar", description="Pede uma nova otimização", value="reotimizar", emoji=EMOJIS_TICKET["reotimizar"]),
@@ -598,7 +712,13 @@ class PainelTicketsSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         tipo = self.values[0]
-        if tipo == "duvidas":
+        if tipo == "diagnostico":
+            await interaction.response.send_message(
+                "Escolhe o problema que melhor descreve o que está a acontecer.",
+                view=EscolherProblemaView(),
+                ephemeral=True,
+            )
+        elif tipo == "duvidas":
             await abrir_ticket(interaction, tipo)
         else:
             await interaction.response.send_modal(FormularioTicket(tipo))
