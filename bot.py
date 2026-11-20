@@ -2,6 +2,7 @@ import os
 import json
 import tempfile
 from contextlib import closing
+from functools import wraps
 from pathlib import Path
 import hashlib
 import hmac
@@ -60,6 +61,31 @@ def init_db():
             log_url TEXT NOT NULL,
             archived_at INTEGER NOT NULL,
             closed_by TEXT NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ticket_assignments (
+            channel_id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            staff_id TEXT NOT NULL,
+            claimed_at INTEGER NOT NULL,
+            panel_message_id TEXT NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS open_tickets (
+            guild_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL UNIQUE,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ticket_cooldowns (
+            guild_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            next_allowed_at REAL NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
         )
     ''')
     conn.commit()
@@ -399,6 +425,9 @@ ID_CARGO_MEMBRO = 1550663372272566382
 ID_CARGO_STAFF = 1550663253032566834
 ID_CANAL_TICKET_LOGS = 1573283569365950616
 
+# Espera de cinco minutos depois de um ticket ser fechado pela equipa.
+TICKET_COOLDOWN_SECONDS = 300
+
 CATEGORIAS_TICKET = {
     "diagnostico": 1572020350902861894,
     "adquirir": 1551424152622080122,
@@ -489,6 +518,8 @@ async def aguardar_bot_voz():
 # Controla aberturas e fechos simultâneos, identifica o autor e regista os fechos.
 ticket_create_lock = asyncio.Lock()
 ticket_close_lock = asyncio.Lock()
+# Mantém os canais recém-criados disponíveis antes de chegar o evento do Discord.
+open_ticket_cache = {}
 
 def ticket_topic(user_id: int, tipo: str) -> str:
     return f"vex-ticket:{user_id}:{tipo}"
@@ -518,24 +549,53 @@ def can_close_ticket(interaction: discord.Interaction) -> bool:
         isinstance(interaction.channel, discord.TextChannel)
         and is_managed_ticket(interaction.channel)
         and isinstance(interaction.user, discord.Member)
-        and (is_staff(interaction.user) or is_ticket_owner(interaction.channel, interaction.user))
+        and is_staff(interaction.user)
     )
 
 
 def record_ticket_closure(channel: discord.TextChannel, member_id: int, status: str):
     with sqlite3.connect(DB_FILE) as conn:
+        previous = conn.execute(
+            "SELECT status FROM ticket_closures WHERE channel_id = ?", (str(channel.id),),
+        ).fetchone()
         conn.execute(
-            '''
+            """
             INSERT INTO ticket_closures
                 (channel_id, guild_id, channel_name, closed_by, closed_at, status)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(channel_id) DO UPDATE SET
                 status=excluded.status, closed_by=excluded.closed_by,
                 closed_at=excluded.closed_at
-            ''',
+            """,
             (str(channel.id), str(channel.guild.id), channel.name,
              str(member_id), int(time.time()), status),
         )
+        if status == "fechado":
+            tracked = conn.execute(
+                "SELECT user_id FROM open_tickets WHERE channel_id = ?", (str(channel.id),),
+            ).fetchone()
+            owner_id = tracked[0] if tracked else ticket_owner_id(channel)
+            if str(owner_id).isdigit() and (not previous or previous[0] != "fechado"):
+                conn.execute(
+                    "INSERT INTO ticket_cooldowns(guild_id, user_id, next_allowed_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(guild_id, user_id) DO UPDATE SET "
+                    "next_allowed_at = MAX(ticket_cooldowns.next_allowed_at, excluded.next_allowed_at)",
+                    (str(channel.guild.id), str(owner_id), time.time() + TICKET_COOLDOWN_SECONDS),
+                )
+            conn.execute("DELETE FROM open_tickets WHERE channel_id = ?", (str(channel.id),))
+    if status == "fechado":
+        for key, value in list(open_ticket_cache.items()):
+            if value == str(channel.id):
+                open_ticket_cache.pop(key, None)
+
+
+def ticket_next_allowed_at(guild_id: int, user_id: int) -> float:
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute(
+            "SELECT next_allowed_at FROM ticket_cooldowns WHERE guild_id = ? AND user_id = ?",
+            (str(guild_id), str(user_id)),
+        ).fetchone()
+    return row[0] if row else 0
 
 
 # ── Tratamento de erros das interações ──
@@ -550,6 +610,28 @@ async def comunicar_erro(interaction: discord.Interaction, mensagem: str):
             await interaction.response.send_message(mensagem, ephemeral=True)
     except discord.HTTPException:
         app.logger.warning("Não foi possível enviar o aviso privado da interação %s.", interaction.id)
+
+
+# ── Proteção contra cliques simultâneos ──
+# Processa uma única ação de cada vez por membro, incluindo menus e formulários.
+active_member_actions = set()
+
+
+def one_action_per_member(callback):
+    @wraps(callback)
+    async def guarded(self, interaction, *args, **kwargs):
+        key = (getattr(interaction, "guild_id", None), interaction.user.id)
+        if key in active_member_actions:
+            await comunicar_erro(
+                interaction, "Já estou a tratar do teu pedido. Aguarda antes de clicar novamente.",
+            )
+            return
+        active_member_actions.add(key)
+        try:
+            return await callback(self, interaction, *args, **kwargs)
+        finally:
+            active_member_actions.discard(key)
+    return guarded
 
 
 class VexView(discord.ui.View):
@@ -586,19 +668,17 @@ def ticket_owner_id(channel: discord.TextChannel) -> str:
     return "não identificado"
 
 
-async def guardar_conversa(channel: discord.TextChannel, fechado_por: discord.Member) -> str:
-    guild = channel.guild
+def validated_log_channel(guild: discord.Guild) -> discord.TextChannel:
     logs = guild.get_channel(ID_CANAL_TICKET_LOGS)
-    if not isinstance(logs, discord.TextChannel) or logs.id == channel.id:
+    if not isinstance(logs, discord.TextChannel):
         raise TicketArchiveError("Não encontrei o canal #ticket-logs configurado.")
-    bot_member = guild.me
-    source_perms = channel.permissions_for(bot_member)
-    log_perms = logs.permissions_for(bot_member)
-    if not (source_perms.view_channel and source_perms.read_message_history):
-        raise TicketArchiveError("O bot precisa de ver o ticket e ler o histórico das mensagens.")
-    if not (log_perms.view_channel and log_perms.send_messages and log_perms.attach_files):
-        raise TicketArchiveError("O bot precisa de ver, enviar mensagens e anexar ficheiros em #ticket-logs.")
-    # Verifica a privacidade do destino antes de enviar conversas de clientes.
+    if guild.me is None:
+        raise TicketArchiveError("O bot ainda está a preparar a ligação ao servidor.")
+    perms = logs.permissions_for(guild.me)
+    if not (perms.view_channel and perms.send_messages and perms.attach_files and perms.read_message_history):
+        raise TicketArchiveError(
+            "O bot precisa de ver, enviar mensagens, anexar ficheiros e ler o histórico em #ticket-logs."
+        )
     for role in guild.roles:
         if (
             role.id != ID_CARGO_STAFF
@@ -606,13 +686,70 @@ async def guardar_conversa(channel: discord.TextChannel, fechado_por: discord.Me
             and not role.permissions.administrator
             and logs.permissions_for(role).view_channel
         ):
-            raise TicketArchiveError("Torna #ticket-logs privado para a equipa antes de arquivar conversas.")
+            raise TicketArchiveError("Torna #ticket-logs privado para a equipa antes de usar os tickets.")
     for target in logs.overwrites:
         if isinstance(target, discord.Member) and not target.bot and not is_staff(target):
             if logs.permissions_for(target).view_channel:
                 raise TicketArchiveError("Há membros fora da equipa com acesso a #ticket-logs.")
+    return logs
+
+
+def validate_ticket_creation(guild: discord.Guild, tipo: str):
+    category_id = CATEGORIAS_TICKET.get(tipo)
+    category = guild.get_channel(category_id) if category_id else None
+    if not isinstance(category, discord.CategoryChannel):
+        raise TicketArchiveError("A categoria deste tipo de ticket está indisponível. Contacta a equipa.")
+    staff_role = guild.get_role(ID_CARGO_STAFF)
+    if staff_role is None or guild.me is None:
+        raise TicketArchiveError("A configuração da equipa de suporte está incompleta. Contacta a equipa.")
+    if not category.permissions_for(guild.me).manage_channels:
+        raise TicketArchiveError("O bot não tem permissão para gerir canais nesta categoria. Contacta a equipa.")
+    validated_log_channel(guild)
+    return category, staff_role
+
+
+def file_sha256(file_path: Path) -> str:
+    digest = hashlib.sha256()
+    with file_path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def verify_saved_file(logs: discord.TextChannel, sent: discord.Message, local_path: Path):
+    # Lê a mensagem enviada, volta a descarregar o anexo e compara o conteúdo.
+    stored = await logs.fetch_message(sent.id)
+    expected_size = local_path.stat().st_size
+    attachment = next(
+        (item for item in stored.attachments if item.size == expected_size), None,
+    )
+    if attachment is None:
+        raise TicketArchiveError("Não consegui confirmar o ficheiro enviado para #ticket-logs.")
+    verification = local_path.with_name(local_path.name + ".verificar")
+    try:
+        await attachment.save(verification)
+        expected, actual = await asyncio.gather(
+            asyncio.to_thread(file_sha256, local_path),
+            asyncio.to_thread(file_sha256, verification),
+        )
+        if expected != actual:
+            raise TicketArchiveError("O ficheiro consultado em #ticket-logs não corresponde ao original.")
+    finally:
+        verification.unlink(missing_ok=True)
+
+
+async def guardar_conversa(channel: discord.TextChannel, fechado_por: discord.Member) -> str:
+    guild = channel.guild
+    logs = validated_log_channel(guild)
+    if logs.id == channel.id:
+        raise TicketArchiveError("O canal de registos não pode ser o próprio ticket.")
+    source_perms = channel.permissions_for(guild.me)
+    if not (source_perms.view_channel and source_perms.read_message_history):
+        raise TicketArchiveError("O bot precisa de ver o ticket e ler o histórico das mensagens.")
 
     owner_id = ticket_owner_id(channel)
+    assignment = get_ticket_assignment(channel.id)
+    assigned_staff = assignment[0] if assignment else "não atribuído"
     stamp = discord.utils.utcnow()
     # A marca delimita o fim desta cópia, incluindo todas as mensagens anteriores.
     marker = await channel.send(
@@ -622,6 +759,7 @@ async def guardar_conversa(channel: discord.TextChannel, fechado_por: discord.Me
     summary = (
         f"📄 Ticket #{channel.name} | ID {channel.id}\n"
         f"Membro (ID): {owner_id}\n"
+        f"Responsável (ID): {assigned_staff}\n"
         f"Fecho pedido por: {fechado_por} | ID {fechado_por.id}\n"
         f"Estado: A ARQUIVAR\n"
         f"Cópia até à mensagem {marker.id}, em {stamp.isoformat()}."
@@ -636,6 +774,7 @@ async def guardar_conversa(channel: discord.TextChannel, fechado_por: discord.Me
                 stream.write(
                     f"VEX — REGISTO DE TICKET\nServidor: {guild.name} ({guild.id})\n"
                     f"Canal: {channel.name} ({channel.id})\nMembro (ID): {owner_id}\n"
+                    f"Responsável (ID): {assigned_staff}\n"
                     f"Fecho pedido por: {fechado_por} ({fechado_por.id})\n"
                     f"Data UTC: {stamp.isoformat()}\n"
                     f"Última mensagem incluída: {marker.id}\n\n"
@@ -674,10 +813,11 @@ async def guardar_conversa(channel: discord.TextChannel, fechado_por: discord.Me
                     part_path = Path(folder) / f"ticket-{channel.id}-parte-{part}.txt"
                     part_path.write_text(text, encoding="utf-8")
                     with closing(discord.File(part_path, filename=part_path.name)) as upload:
-                        await logs.send(
+                        sent = await logs.send(
                             content=f"Ticket {channel.id} | conversa, parte {part}",
                             file=upload, allowed_mentions=discord.AllowedMentions.none(),
                         )
+                    await verify_saved_file(logs, sent, part_path)
 
             # Mantém cópias no canal de registos para sobreviver à eliminação do ticket.
             for message_id, attachment in attachments:
@@ -693,10 +833,11 @@ async def guardar_conversa(channel: discord.TextChannel, fechado_por: discord.Me
                     await attachment.save(local_file, use_cached=True)
                 filename = f"{attachment.id}-{Path(attachment.filename).name}"[:240]
                 with closing(discord.File(local_file, filename=filename)) as upload:
-                    await logs.send(
+                    sent = await logs.send(
                         content=f"Ticket {channel.id} | mensagem {message_id} | anexo {attachment.id}",
                         file=upload, allowed_mentions=discord.AllowedMentions.none(),
                     )
+                await verify_saved_file(logs, sent, local_file)
                 local_file.unlink()
 
         await header.edit(
@@ -733,10 +874,11 @@ class ConfirmarFechoView(VexView):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.requester_id and can_close_ticket(interaction):
             return True
-        await interaction.response.send_message("Não tens permissão para fechar este ticket.", ephemeral=True)
+        await interaction.response.send_message("Só o away e a equipa podem fechar tickets.", ephemeral=True)
         return False
 
     @discord.ui.button(label="Confirmar fecho", style=discord.ButtonStyle.danger)
+    @one_action_per_member
     async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         self.stop()
@@ -788,67 +930,278 @@ class ConfirmarFechoView(VexView):
             await comunicar_erro(interaction, "A conversa foi guardada no registo privado da equipa. Ticket fechado.")
 
     @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+    @one_action_per_member
     async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Fecho cancelado.", view=None)
         self.stop()
 
 
-class TicketOpcoesView(VexView):
-    def __init__(self):
-        super().__init__(timeout=None)
+# ── Atribuição do atendimento ──
+# Uma reserva atómica impede que dois membros da equipa assumam o mesmo ticket.
+# A base de dados mantém o responsável após reiniciar o bot.
+def get_ticket_assignment(channel_id: int):
+    with sqlite3.connect(DB_FILE) as conn:
+        return conn.execute(
+            "SELECT staff_id, claimed_at, panel_message_id FROM ticket_assignments WHERE channel_id = ?",
+            (str(channel_id),),
+        ).fetchone()
 
-    @discord.ui.button(label="Fechar ticket", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="ticket_finalizar_btn")
+
+def reserve_ticket_assignment(channel_id: int, guild_id: int, staff_id: int, message_id: int):
+    with sqlite3.connect(DB_FILE) as conn:
+        closed = conn.execute(
+            "SELECT status FROM ticket_closures WHERE channel_id = ?", (str(channel_id),),
+        ).fetchone()
+        if closed and closed[0] == "fechado":
+            return None
+        conn.execute(
+            "INSERT OR IGNORE INTO ticket_assignments "
+            "(channel_id, guild_id, staff_id, claimed_at, panel_message_id) VALUES (?, ?, ?, ?, ?)",
+            (str(channel_id), str(guild_id), str(staff_id), int(time.time()), str(message_id)),
+        )
+        row = conn.execute(
+            "SELECT staff_id, claimed_at, panel_message_id FROM ticket_assignments WHERE channel_id = ?",
+            (str(channel_id),),
+        ).fetchone()
+    return row
+
+
+def get_active_ticket_assignments():
+    with sqlite3.connect(DB_FILE) as conn:
+        return conn.execute(
+            "SELECT a.channel_id, a.guild_id, a.staff_id, a.claimed_at, a.panel_message_id "
+            "FROM ticket_assignments a LEFT JOIN ticket_closures c ON a.channel_id = c.channel_id "
+            "WHERE c.status IS NULL OR c.status != 'fechado'"
+        ).fetchall()
+
+
+async def update_ticket_assignment_message(message: discord.Message, staff_id: str):
+    embeds = [discord.Embed.from_dict(embed.to_dict()) for embed in message.embeds]
+    if not embeds:
+        embeds = [discord.Embed(title="Atendimento Vex", color=discord.Color.blurple())]
+    embed = embeds[0]
+    for index in range(len(embed.fields) - 1, -1, -1):
+        if embed.fields[index].name == "Atendimento":
+            embed.remove_field(index)
+    embed.add_field(
+        name="Atendimento",
+        value=f"✅ O <@{staff_id}> está a acompanhar o teu pedido.",
+        inline=False,
+    )
+    await message.edit(
+        embeds=embeds,
+        view=TicketOpcoesView(assigned=True),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def restore_ticket_assignments():
+    # Repõe a informação se um reinício interrompeu a atualização da mensagem.
+    for channel_id, guild_id, staff_id, claimed_at, message_id in get_active_ticket_assignments():
+        async with ticket_close_lock:
+            guild = bot.get_guild(int(guild_id))
+            channel = guild.get_channel(int(channel_id)) if guild else None
+            if not isinstance(channel, discord.TextChannel) or not is_managed_ticket(channel):
+                continue
+            try:
+                message = await channel.fetch_message(int(message_id))
+                await update_ticket_assignment_message(message, staff_id)
+            except discord.HTTPException:
+                app.logger.warning("Não foi possível repor o atendimento do ticket %s.", channel_id)
+
+
+class TicketOpcoesView(VexView):
+    def __init__(self, assigned: bool = False):
+        super().__init__(timeout=None)
+        self.assumir.disabled = assigned
+        self.assumir.label = "Atendimento assumido" if assigned else "Assumir atendimento"
+
+    @discord.ui.button(
+        label="Assumir atendimento",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="ticket_assumir_btn",
+    )
+    @one_action_per_member
+    async def assumir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        member = interaction.user
+        if (
+            not isinstance(member, discord.Member)
+            or not is_staff(member)
+            or not isinstance(channel, discord.TextChannel)
+            or not is_managed_ticket(channel)
+        ):
+            await interaction.response.send_message(
+                "Só a equipa pode assumir o atendimento de um ticket.", ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        # O mesmo bloqueio do fecho evita atribuições durante o arquivo da conversa.
+        async with ticket_close_lock:
+            if channel.guild.get_channel(channel.id) is None:
+                await comunicar_erro(interaction, "Este ticket já foi fechado.")
+                return
+            if not is_staff(member):
+                await comunicar_erro(interaction, "Já não tens permissão para assumir o atendimento.")
+                return
+            if interaction.message is None:
+                await comunicar_erro(interaction, "Não encontrei a mensagem inicial deste ticket.")
+                return
+            assignment = reserve_ticket_assignment(
+                channel.id, channel.guild.id, member.id, interaction.message.id,
+            )
+            if assignment is None:
+                await comunicar_erro(interaction, "Este ticket já foi fechado.")
+                return
+            staff_id, claimed_at, message_id = assignment
+            if staff_id != str(member.id):
+                await interaction.followup.send(
+                    f"Este ticket já está a ser acompanhado por <@{staff_id}>.",
+                    ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            try:
+                await update_ticket_assignment_message(interaction.message, staff_id)
+            except discord.HTTPException:
+                app.logger.exception("Atendimento reservado, mas a mensagem do ticket %s não foi atualizada.", channel.id)
+                await comunicar_erro(
+                    interaction,
+                    "O ticket ficou atribuído a ti, mas não consegui atualizar a mensagem. "
+                    "Podes clicar novamente para tentar atualizar.",
+                )
+                return
+        await interaction.followup.send("Assumiste o atendimento deste ticket.", ephemeral=True)
+
+    @discord.ui.button(
+        label="Fechar ticket",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+        custom_id="ticket_finalizar_btn",
+    )
+    @one_action_per_member
     async def finalizar(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_close_ticket(interaction):
-            await interaction.response.send_message("Não tens permissão para fechar este ticket.", ephemeral=True)
+            await interaction.response.send_message("Só o away e a equipa podem fechar tickets.", ephemeral=True)
             return
         await interaction.response.send_message(
             "Queres fechar este ticket? A conversa e os anexos serão guardados no registo privado da equipa antes de o canal ser apagado.",
             view=ConfirmarFechoView(interaction.user.id), ephemeral=True,
         )
 
+
+# ── Um ticket aberto por membro ──
+# O limite conta todos os tipos e continua válido após reiniciar o bot.
+def remember_open_ticket(guild_id: int, user_id: int, channel_id: int):
+    key = (str(guild_id), str(user_id))
+    open_ticket_cache[key] = str(channel_id)
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute(
+            "INSERT INTO open_tickets(guild_id, user_id, channel_id) VALUES (?, ?, ?) "
+            "ON CONFLICT(guild_id, user_id) DO UPDATE SET channel_id = excluded.channel_id",
+            (str(guild_id), str(user_id), str(channel_id)),
+        )
+
+
+def forget_open_ticket(channel_id: int):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("DELETE FROM open_tickets WHERE channel_id = ?", (str(channel_id),))
+    for key, value in list(open_ticket_cache.items()):
+        if value == str(channel_id):
+            open_ticket_cache.pop(key, None)
+
+
+async def find_open_ticket(guild: discord.Guild, member: discord.Member):
+    key = (str(guild.id), str(member.id))
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute(
+            "SELECT channel_id FROM open_tickets WHERE guild_id = ? AND user_id = ?", key,
+        ).fetchone()
+        closed = {
+            item[0] for item in conn.execute(
+                "SELECT channel_id FROM ticket_closures WHERE guild_id = ? AND status = 'fechado'",
+                (str(guild.id),),
+            )
+        }
+    tracked_id = row[0] if row else open_ticket_cache.get(key)
+    if tracked_id:
+        if tracked_id not in closed:
+            try:
+                existing = await guild.fetch_channel(int(tracked_id))
+            except discord.NotFound:
+                existing = None
+            # Perder acesso ao canal é um erro, não autorização para abrir outro.
+            if isinstance(existing, discord.TextChannel):
+                return str(existing.id)
+        forget_open_ticket(int(tracked_id))
+
+    # Reconhece também tickets criados por versões anteriores do bot.
+    for channel in guild.text_channels:
+        if (
+            str(channel.id) not in closed
+            and is_managed_ticket(channel)
+            and is_ticket_owner(channel, member)
+        ):
+            try:
+                existing = await guild.fetch_channel(channel.id)
+            except discord.NotFound:
+                continue
+            if isinstance(existing, discord.TextChannel):
+                remember_open_ticket(guild.id, member.id, existing.id)
+                return str(existing.id)
+    return None
+
+
 # ── Abertura de tickets privados ──
-# Verifica se já existe um pedido do mesmo tipo e abre um canal privado de suporte.
 async def abrir_ticket(interaction: discord.Interaction, tipo: str, respostas=()):
     await interaction.response.defer(ephemeral=True, thinking=True)
     guild = interaction.guild
     if guild is None or not isinstance(interaction.user, discord.Member):
         await interaction.followup.send("Abre o ticket dentro do servidor.", ephemeral=True)
         return
-    categoria = guild.get_channel(CATEGORIAS_TICKET[tipo])
-    if not isinstance(categoria, discord.CategoryChannel):
-        await interaction.followup.send("A categoria de suporte está indisponível. Contacta a equipa.", ephemeral=True)
-        return
-    cargo_staff = guild.get_role(ID_CARGO_STAFF)
-    if cargo_staff is None or guild.me is None:
-        await interaction.followup.send("O suporte está temporariamente indisponível. Contacta a equipa.", ephemeral=True)
-        return
     topic = ticket_topic(interaction.user.id, tipo)
     async with ticket_create_lock:
         canal = None
         try:
-            canais = guild.text_channels
-            existente = next((
-                item for item in canais if isinstance(item, discord.TextChannel) and (
-                    item.topic == topic or (
-                        item.category_id == categoria.id and not (item.topic or "").startswith("vex-ticket:")
-                        and item.name.endswith(f"-{tipo}") and is_ticket_owner(item, interaction.user)
-                    )
+            existing_id = await find_open_ticket(guild, interaction.user)
+            if existing_id:
+                await interaction.followup.send(
+                    f"Já tens um ticket aberto: <#{existing_id}>. "
+                    "Continua o teu pedido nesse canal. Só podes ter um ticket aberto de cada vez.",
+                    ephemeral=True,
                 )
-            ), None)
-            if existente:
-                await interaction.followup.send(f"Já tens um ticket aberto: {existente.mention}", ephemeral=True)
+                return
+            next_allowed = ticket_next_allowed_at(guild.id, interaction.user.id)
+            if next_allowed > time.time():
+                await interaction.followup.send(
+                    f"O teu último ticket foi fechado há pouco. "
+                    f"Podes abrir um novo ticket <t:{int(next_allowed)}:R>.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                categoria, cargo_staff = validate_ticket_creation(guild, tipo)
+            except TicketArchiveError as error:
+                app.logger.warning("Configuração inválida ao abrir ticket: %s", error)
+                await interaction.followup.send(str(error), ephemeral=True)
                 return
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-                cargo_staff: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                interaction.user: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True,
+                ),
+                cargo_staff: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True,
+                ),
+                guild.me: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True,
+                ),
             }
             canal = await guild.create_text_channel(
                 f"{interaction.user.name}-{tipo}".lower(),
                 category=categoria, overwrites=overwrites, topic=topic,
             )
+            remember_open_ticket(guild.id, interaction.user.id, canal.id)
             embed = montar_embed_ticket(tipo, interaction.user)
             for label, value in respostas:
                 embed.add_field(name=label, value=discord.utils.escape_markdown(value), inline=False)
@@ -856,16 +1209,23 @@ async def abrir_ticket(interaction: discord.Interaction, tipo: str, respostas=()
                 content=f"{interaction.user.mention} | {cargo_staff.mention}",
                 embed=embed, view=TicketOpcoesView(),
             )
-        except discord.HTTPException:
+        except (discord.HTTPException, sqlite3.Error):
             app.logger.exception("Falhou a abertura do ticket do membro %s.", interaction.user.id)
             if canal is not None:
                 try:
-                    await canal.delete(reason="Não foi possível publicar a mensagem inicial do ticket")
+                    await canal.delete(reason="Não foi possível concluir a abertura do ticket")
+                except discord.NotFound:
+                    forget_open_ticket(canal.id)
                 except discord.HTTPException:
                     app.logger.exception("Não foi possível limpar o ticket incompleto %s.", canal.id)
-            await interaction.followup.send("Não foi possível abrir o ticket. Tenta novamente ou contacta a equipa.", ephemeral=True)
+                else:
+                    forget_open_ticket(canal.id)
+            await interaction.followup.send(
+                "Não foi possível abrir o ticket. Tenta novamente ou contacta a equipa.", ephemeral=True,
+            )
             return
     await interaction.followup.send(f"O teu ticket foi criado aqui: {canal.mention}", ephemeral=True)
+
 
 # ── Formulários e painel de tickets ──
 # Recolhe dados para otimização e reotimização. Os tickets de dúvidas abrem diretamente.
@@ -889,6 +1249,7 @@ class FormularioTicket(VexModal):
             self.add_item(field)
             self.perguntas.append((label, field))
 
+    @one_action_per_member
     async def on_submit(self, interaction: discord.Interaction):
         respostas = [(label, field.value.strip() or "Sem resposta") for label, field in self.perguntas]
         await abrir_ticket(interaction, self.tipo, respostas)
@@ -935,6 +1296,7 @@ class AbrirDiagnosticoView(VexView):
         emoji="🎫",
         style=discord.ButtonStyle.primary,
     )
+    @one_action_per_member
     async def abrir(self, interaction: discord.Interaction, button: discord.ui.Button):
         await abrir_ticket(interaction, "diagnostico", self.respostas)
 
@@ -953,6 +1315,7 @@ class FormularioDiagnostico(VexModal):
         super().__init__(title="Diagnóstico gratuito")
         self.tipo = tipo
 
+    @one_action_per_member
     async def on_submit(self, interaction: discord.Interaction):
         titulo, sugestao = DIAGNOSTICOS[self.tipo]
         respostas = [
@@ -986,6 +1349,7 @@ class EscolherProblemaSelect(discord.ui.Select):
             ],
         )
 
+    @one_action_per_member
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(FormularioDiagnostico(self.values[0]))
 
@@ -1030,6 +1394,7 @@ class PainelTicketsSelect(discord.ui.Select):
             custom_id="painel_tickets_select",
         )
 
+    @one_action_per_member
     async def callback(self, interaction: discord.Interaction):
         tipo = self.values[0]
         if tipo == "diagnostico":
@@ -1067,6 +1432,8 @@ class MeuBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(PainelTicketsView())
         self.add_view(TicketOpcoesView())
+        for channel_id, guild_id, staff_id, claimed_at, message_id in get_active_ticket_assignments():
+            self.add_view(TicketOpcoesView(assigned=True), message_id=int(message_id))
         await self.tree.sync()
         if not manter_voz_247.is_running():
             manter_voz_247.start()
@@ -1094,6 +1461,7 @@ async def tratar_erro_comando(interaction: discord.Interaction, error: app_comma
 async def on_ready():
     print(f'O bot {bot.user} arrancou e está pronto a usar!')
     await entrar_na_chamada_247()
+    await restore_ticket_assignments()
 
 
 @bot.event
