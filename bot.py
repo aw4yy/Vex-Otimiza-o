@@ -1,4 +1,8 @@
 import os
+import json
+import tempfile
+from contextlib import closing
+from pathlib import Path
 import hashlib
 import hmac
 import secrets
@@ -10,9 +14,10 @@ import requests
 import time
 import urllib.parse
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from flask import Flask, request, redirect, session
+from werkzeug.serving import WSGIRequestHandler
 
 # ── Servidor Web ──
 # Cria a aplicação Flask que recebe os pedidos de verificação.
@@ -21,7 +26,9 @@ app = Flask(__name__)
 # ── Base de dados SQLite ──
 # Define onde fica o auth_tokens.db e guarda as autorizações e os fechos de tickets.
 DATA_PATH = os.getenv("DATA_PATH")
-if DATA_PATH and os.path.exists(DATA_PATH):
+if DATA_PATH:
+    if not os.path.isdir(DATA_PATH):
+        raise RuntimeError("DATA_PATH não aponta para uma pasta existente. Confirma o caminho da base de dados.")
     DB_FILE = os.path.join(DATA_PATH, "auth_tokens.db")
 else:
     DB_FILE = "auth_tokens.db"
@@ -45,6 +52,14 @@ def init_db():
             closed_by TEXT NOT NULL,
             closed_at INTEGER NOT NULL,
             status TEXT NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ticket_archives (
+            channel_id TEXT PRIMARY KEY,
+            log_url TEXT NOT NULL,
+            archived_at INTEGER NOT NULL,
+            closed_by TEXT NOT NULL
         )
     ''')
     conn.commit()
@@ -154,7 +169,7 @@ def callback():
         'redirect_uri': REDIRECT_URI
     }
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    
+
     try:
         response = requests.post(token_url, data=payload, headers=headers, timeout=10)
         response.raise_for_status()
@@ -175,7 +190,7 @@ def callback():
         return "Não foi possível confirmar a conta. Tenta novamente.", 502
 
     avatar_hash = user_data.get('avatar')
-    
+
     if avatar_hash:
         user_avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=128"
     else:
@@ -309,9 +324,22 @@ def callback():
 
 # ── Arranque do servidor Web ──
 # Inicia o Flask em paralelo com o bot para receber os pedidos de verificação.
+class VexRequestHandler(WSGIRequestHandler):
+    def log_request(self, code="-", size="-"):
+        original = self.requestline
+        parts = original.split(" ", 2)
+        if len(parts) == 3:
+            parts[1] = parts[1].split("?", 1)[0]
+            self.requestline = " ".join(parts)
+        try:
+            super().log_request(code, size)
+        finally:
+            self.requestline = original
+
+
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, request_handler=VexRequestHandler)
 
 def keep_alive():
     t = threading.Thread(target=run_web_server)
@@ -320,27 +348,56 @@ def keep_alive():
 
 # ── Autorizações do Discord ──
 # Renova tokens expirados e usa as autorizações guardadas para adicionar membros.
+oauth_refresh_lock = threading.Lock()
+
+
 def refresh_access_token(user_id: str, refresh_token: str):
-    token_url = "https://discord.com/api/oauth2/token"
-    payload = {'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET, 'grant_type': 'refresh_token', 'refresh_token': refresh_token}
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    response = requests.post(token_url, data=payload, headers=headers)
-    if response.status_code == 200:
-        data = response.json()
-        save_user_tokens(user_id, data['access_token'], data['refresh_token'], data['expires_in'])
-        return data['access_token']
-    return None
+    # Evita renovar duas vezes o mesmo token em pedidos simultâneos.
+    with oauth_refresh_lock:
+        row = get_user_token(user_id)
+        if row:
+            if row[3] > time.time() + 30:
+                return row[1]
+            refresh_token = row[2]
+        payload = {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+        try:
+            response = requests.post(
+                "https://discord.com/api/oauth2/token", data=payload, timeout=15,
+            )
+            response.raise_for_status()
+            data = response.json()
+            save_user_tokens(user_id, data["access_token"], data["refresh_token"], data["expires_in"])
+            return data["access_token"]
+        except (requests.RequestException, ValueError, KeyError):
+            app.logger.warning("Não foi possível renovar a autorização do membro %s.", user_id)
+            return None
+
 
 def add_user_to_guild(access_token: str, guild_id: int, user_id: str, bot_token: str):
     url = f"https://discord.com/api/v10/guilds/{guild_id}/members/{user_id}"
-    headers = {"Authorization": f"Bot {bot_token}", "Content-Type": "application/json"}
-    response = requests.put(url, json={"access_token": access_token}, headers=headers)
-    return response.status_code
+    headers = {"Authorization": f"Bot {bot_token}"}
+    try:
+        response = requests.put(
+            url, json={"access_token": access_token}, headers=headers, timeout=15,
+        )
+        if response.status_code == 429:
+            app.logger.warning("Limite temporário do Discord ao adicionar o membro %s.", user_id)
+        return response.status_code
+    except requests.RequestException:
+        app.logger.warning("Falhou a ligação ao Discord ao adicionar o membro %s.", user_id)
+        return 0
+
 
 # ── Configuração do servidor Discord ──
 # Define os cargos, as categorias, os emojis e o horário de atendimento.
 ID_CARGO_MEMBRO = 1550663372272566382
 ID_CARGO_STAFF = 1550663253032566834
+ID_CANAL_TICKET_LOGS = 1573283569365950616
 
 CATEGORIAS_TICKET = {
     "diagnostico": 1572020350902861894,
@@ -389,27 +446,43 @@ def montar_embed_ticket(tipo: str, autor: discord.abc.User) -> discord.Embed:
     return embed
 
 
-
 # ── Ligação ao canal de voz ──
 # Liga o bot ao canal configurado quando ainda não está ligado.
+voice_connect_lock = asyncio.Lock()
+
+
 async def entrar_na_chamada_247():
     """Liga o bot ao canal de voz configurado, se ainda não estiver lá."""
     if not ID_CANAL_VOZ_24_7:
         return
 
-    canal = bot.get_channel(ID_CANAL_VOZ_24_7)
-    if canal is None:
-        print("AVISO: não encontrei o canal de voz configurado em ID_CANAL_VOZ_24_7.")
+    if voice_connect_lock.locked():
         return
+    async with voice_connect_lock:
+        canal = bot.get_channel(ID_CANAL_VOZ_24_7)
+        if not isinstance(canal, discord.VoiceChannel):
+            app.logger.warning("O canal de voz 24/7 não foi encontrado ou não é um canal de voz normal.")
+            return
+        voice = canal.guild.voice_client
+        if voice is not None and voice.is_connected():
+            return
+        try:
+            if voice is not None:
+                await voice.disconnect(force=True)
+            await canal.connect(reconnect=True, self_deaf=True)
+            print(f"Entrei na chamada 24/7: {canal.name}")
+        except Exception:
+            app.logger.exception("Não foi possível ligar ao canal de voz 24/7.")
 
-    if canal.guild.voice_client is not None:
-        return  # já está ligado
 
-    try:
-        await canal.connect(reconnect=True, self_deaf=True)
-        print(f"Entrei na chamada 24/7: {canal.name}")
-    except Exception as e:
-        print(f"Erro ao entrar na chamada 24/7: {e!r}")
+@tasks.loop(seconds=60)
+async def manter_voz_247():
+    await entrar_na_chamada_247()
+
+
+@manter_voz_247.before_loop
+async def aguardar_bot_voz():
+    await bot.wait_until_ready()
 
 
 # ── Sistema de tickets ──
@@ -430,12 +503,24 @@ def is_ticket_owner(channel: discord.TextChannel, member: discord.Member) -> boo
     permissions = channel.overwrites_for(member)
     return permissions.view_channel is True and permissions.send_messages is True
 
+def is_managed_ticket(channel: discord.TextChannel) -> bool:
+    parts = (channel.topic or "").split(":")
+    if len(parts) == 3 and parts[0] == "vex-ticket" and parts[1].isdigit():
+        return parts[2] in CATEGORIAS_TICKET
+    return (
+        channel.category_id in CATEGORIAS_TICKET.values()
+        and any(channel.name.endswith(f"-{tipo}") for tipo in CATEGORIAS_TICKET)
+    )
+
+
 def can_close_ticket(interaction: discord.Interaction) -> bool:
     return (
         isinstance(interaction.channel, discord.TextChannel)
+        and is_managed_ticket(interaction.channel)
         and isinstance(interaction.user, discord.Member)
         and (is_staff(interaction.user) or is_ticket_owner(interaction.channel, interaction.user))
     )
+
 
 def record_ticket_closure(channel: discord.TextChannel, member_id: int, status: str):
     with sqlite3.connect(DB_FILE) as conn:
@@ -452,9 +537,195 @@ def record_ticket_closure(channel: discord.TextChannel, member_id: int, status: 
              str(member_id), int(time.time()), status),
         )
 
+
+# ── Tratamento de erros das interações ──
+# Mostra uma resposta privada em vez de deixar o membro à espera.
+async def comunicar_erro(interaction: discord.Interaction, mensagem: str):
+    if interaction.is_expired():
+        return
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(mensagem, ephemeral=True)
+        else:
+            await interaction.response.send_message(mensagem, ephemeral=True)
+    except discord.HTTPException:
+        app.logger.warning("Não foi possível enviar o aviso privado da interação %s.", interaction.id)
+
+
+class VexView(discord.ui.View):
+    async def on_error(self, interaction, error, item):
+        app.logger.error("Falha num botão ou menu.", exc_info=(type(error), error, error.__traceback__))
+        await comunicar_erro(interaction, "Ocorreu um erro. Tenta novamente ou contacta a equipa.")
+
+
+class VexModal(discord.ui.Modal):
+    async def on_error(self, interaction, error):
+        app.logger.error("Falha num formulário.", exc_info=(type(error), error, error.__traceback__))
+        await comunicar_erro(interaction, "Não foi possível concluir o formulário. Tenta novamente.")
+
+
+# ── Arquivo dos tickets ──
+# Guarda as mensagens e cópias dos anexos antes de apagar o canal.
+class TicketArchiveError(Exception):
+    pass
+
+
+def ticket_owner_id(channel: discord.TextChannel) -> str:
+    parts = (channel.topic or "").split(":")
+    if len(parts) == 3 and parts[0] == "vex-ticket" and parts[1].isdigit():
+        return parts[1]
+    for target, overwrite in channel.overwrites.items():
+        if (
+            isinstance(target, discord.Member)
+            and not target.bot
+            and not is_staff(target)
+            and overwrite.view_channel is True
+            and overwrite.send_messages is True
+        ):
+            return str(target.id)
+    return "não identificado"
+
+
+async def guardar_conversa(channel: discord.TextChannel, fechado_por: discord.Member) -> str:
+    guild = channel.guild
+    logs = guild.get_channel(ID_CANAL_TICKET_LOGS)
+    if not isinstance(logs, discord.TextChannel) or logs.id == channel.id:
+        raise TicketArchiveError("Não encontrei o canal #ticket-logs configurado.")
+    bot_member = guild.me
+    source_perms = channel.permissions_for(bot_member)
+    log_perms = logs.permissions_for(bot_member)
+    if not (source_perms.view_channel and source_perms.read_message_history):
+        raise TicketArchiveError("O bot precisa de ver o ticket e ler o histórico das mensagens.")
+    if not (log_perms.view_channel and log_perms.send_messages and log_perms.attach_files):
+        raise TicketArchiveError("O bot precisa de ver, enviar mensagens e anexar ficheiros em #ticket-logs.")
+    # Verifica a privacidade do destino antes de enviar conversas de clientes.
+    for role in guild.roles:
+        if (
+            role.id != ID_CARGO_STAFF
+            and not role.is_bot_managed()
+            and not role.permissions.administrator
+            and logs.permissions_for(role).view_channel
+        ):
+            raise TicketArchiveError("Torna #ticket-logs privado para a equipa antes de arquivar conversas.")
+    for target in logs.overwrites:
+        if isinstance(target, discord.Member) and not target.bot and not is_staff(target):
+            if logs.permissions_for(target).view_channel:
+                raise TicketArchiveError("Há membros fora da equipa com acesso a #ticket-logs.")
+
+    owner_id = ticket_owner_id(channel)
+    stamp = discord.utils.utcnow()
+    # A marca delimita o fim desta cópia, incluindo todas as mensagens anteriores.
+    marker = await channel.send(
+        "📄 A guardar a conversa e os anexos antes de fechar este ticket…",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    summary = (
+        f"📄 Ticket #{channel.name} | ID {channel.id}\n"
+        f"Membro (ID): {owner_id}\n"
+        f"Fecho pedido por: {fechado_por} | ID {fechado_por.id}\n"
+        f"Estado: A ARQUIVAR\n"
+        f"Cópia até à mensagem {marker.id}, em {stamp.isoformat()}."
+    )
+    header = await logs.send(summary, allowed_mentions=discord.AllowedMentions.none())
+    message_count = 0
+    attachments = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="vex-ticket-") as folder:
+            transcript = Path(folder) / f"ticket-{channel.id}.txt"
+            with transcript.open("w", encoding="utf-8") as stream:
+                stream.write(
+                    f"VEX — REGISTO DE TICKET\nServidor: {guild.name} ({guild.id})\n"
+                    f"Canal: {channel.name} ({channel.id})\nMembro (ID): {owner_id}\n"
+                    f"Fecho pedido por: {fechado_por} ({fechado_por.id})\n"
+                    f"Data UTC: {stamp.isoformat()}\n"
+                    f"Última mensagem incluída: {marker.id}\n\n"
+                )
+                async for message in channel.history(
+                    limit=None, oldest_first=True, before=discord.Object(id=marker.id + 1),
+                ):
+                    message_count += 1
+                    stream.write(
+                        f"[{message.created_at.isoformat()}] {message.author} "
+                        f"(ID {message.author.id}) — mensagem {message.id}\n"
+                    )
+                    if message.edited_at:
+                        stream.write(f"Editada em: {message.edited_at.isoformat()}\n")
+                    if message.reference and message.reference.message_id:
+                        stream.write(f"Resposta à mensagem: {message.reference.message_id}\n")
+                    stream.write(message.content + "\n")
+                    for embed in message.embeds:
+                        stream.write("EMBED: " + json.dumps(embed.to_dict(), ensure_ascii=False) + "\n")
+                    for attachment in message.attachments:
+                        stream.write(
+                            f"ANEXO: {attachment.filename} | {attachment.size} bytes | "
+                            f"ID {attachment.id}\n{attachment.url}\n"
+                        )
+                        attachments.append((message.id, attachment))
+                    for sticker in message.stickers:
+                        stream.write(f"STICKER: {sticker.name} | {sticker.url}\n")
+                    stream.write("\n")
+
+            # Divide históricos longos em partes UTF-8 válidas dentro do limite de envio.
+            limit = min(guild.filesize_limit, 8 * 1024 * 1024)
+            with transcript.open(encoding="utf-8") as stream:
+                part = 0
+                while text := stream.read(max(1, (limit - 1024) // 4)):
+                    part += 1
+                    part_path = Path(folder) / f"ticket-{channel.id}-parte-{part}.txt"
+                    part_path.write_text(text, encoding="utf-8")
+                    with closing(discord.File(part_path, filename=part_path.name)) as upload:
+                        await logs.send(
+                            content=f"Ticket {channel.id} | conversa, parte {part}",
+                            file=upload, allowed_mentions=discord.AllowedMentions.none(),
+                        )
+
+            # Mantém cópias no canal de registos para sobreviver à eliminação do ticket.
+            for message_id, attachment in attachments:
+                if attachment.size > guild.filesize_limit:
+                    raise TicketArchiveError(
+                        f"O anexo {attachment.id} ultrapassa o limite atual de envio do Discord. "
+                        "O ticket fica aberto para resolver o arquivo desse ficheiro."
+                    )
+                local_file = Path(folder) / f"anexo-{attachment.id}.bin"
+                try:
+                    await attachment.save(local_file)
+                except discord.HTTPException:
+                    await attachment.save(local_file, use_cached=True)
+                filename = f"{attachment.id}-{Path(attachment.filename).name}"[:240]
+                with closing(discord.File(local_file, filename=filename)) as upload:
+                    await logs.send(
+                        content=f"Ticket {channel.id} | mensagem {message_id} | anexo {attachment.id}",
+                        file=upload, allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                local_file.unlink()
+
+        await header.edit(
+            content=summary.replace("A ARQUIVAR", "ARQUIVADO — FECHO PENDENTE")
+            + f"\nMensagens: {message_count} | Anexos copiados: {len(attachments)}",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO ticket_archives(channel_id, log_url, archived_at, closed_by) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(channel_id) DO UPDATE SET "
+                "log_url=excluded.log_url, archived_at=excluded.archived_at, closed_by=excluded.closed_by",
+                (str(channel.id), header.jump_url, int(time.time()), str(fechado_por.id)),
+            )
+        return header.jump_url
+    except Exception:
+        try:
+            await header.edit(
+                content=summary.replace("A ARQUIVAR", "INCOMPLETO — TICKET MANTIDO ABERTO"),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            app.logger.warning("Não foi possível atualizar o estado do arquivo %s.", header.id)
+        raise
+
+
 # ── Confirmação de fecho ──
-# Pede confirmação ao autor ou à equipa antes de apagar o canal do ticket.
-class ConfirmarFechoView(discord.ui.View):
+# Confirma a autorização, arquiva a conversa e só depois apaga o canal.
+class ConfirmarFechoView(VexView):
     def __init__(self, requester_id: int):
         super().__init__(timeout=60)
         self.requester_id = requester_id
@@ -467,33 +738,62 @@ class ConfirmarFechoView(discord.ui.View):
 
     @discord.ui.button(label="Confirmar fecho", style=discord.ButtonStyle.danger)
     async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="A fechar o ticket…", view=None)
+        await interaction.response.defer()
         self.stop()
+        await interaction.edit_original_response(
+            content="A guardar a conversa e os anexos antes de fechar…", view=None,
+        )
         channel = interaction.channel
         async with ticket_close_lock:
             if channel.guild.get_channel(channel.id) is None:
                 return
-            try:
-                record_ticket_closure(channel, interaction.user.id, "pendente")
-            except sqlite3.Error:
-                await interaction.followup.send("Não foi possível guardar o registo. O ticket continua aberto.", ephemeral=True)
+            if not can_close_ticket(interaction):
+                await interaction.edit_original_response(content="Já não tens permissão para fechar este ticket.")
                 return
             try:
-                await channel.delete(reason=f"Ticket fechado por {interaction.user.id}")
+                record_ticket_closure(channel, interaction.user.id, "pendente")
+                log_url = await guardar_conversa(channel, interaction.user)
+            except Exception as error:
+                app.logger.exception("Não foi possível arquivar o ticket %s.", channel.id)
+                try:
+                    record_ticket_closure(channel, interaction.user.id, "arquivo_falhou")
+                except sqlite3.Error:
+                    app.logger.exception("Não foi possível atualizar o histórico do ticket.")
+                reason = str(error) if isinstance(error, TicketArchiveError) else "Falhou o envio do registo ou de um anexo."
+                await comunicar_erro(
+                    interaction, f"{reason} O ticket continua aberto. Contacta a equipa ou tenta fechar novamente.",
+                )
+                return
+            try:
+                await channel.delete(reason=f"Ticket arquivado e fechado por {interaction.user.id}")
             except discord.NotFound:
                 pass
             except discord.HTTPException:
-                record_ticket_closure(channel, interaction.user.id, "falhou")
-                await interaction.followup.send("Não foi possível fechar o ticket. Tenta novamente.", ephemeral=True)
+                record_ticket_closure(channel, interaction.user.id, "fecho_falhou")
+                await comunicar_erro(interaction, "A conversa foi guardada, mas não consegui apagar o canal. Podes tentar novamente.")
                 return
-            record_ticket_closure(channel, interaction.user.id, "fechado")
+            try:
+                record_ticket_closure(channel, interaction.user.id, "fechado")
+            except sqlite3.Error:
+                app.logger.exception("Ticket %s apagado após arquivo, mas falhou a atualização do histórico.", channel.id)
+            try:
+                message_id = int(log_url.rsplit("/", 1)[1])
+                log_message = await channel.guild.get_channel(ID_CANAL_TICKET_LOGS).fetch_message(message_id)
+                await log_message.edit(
+                    content=log_message.content.replace("ARQUIVADO — FECHO PENDENTE", "ARQUIVADO — TICKET FECHADO"),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.HTTPException, AttributeError):
+                app.logger.warning("O ticket %s foi fechado; o registo continua com fecho pendente.", channel.id)
+            await comunicar_erro(interaction, "A conversa foi guardada no registo privado da equipa. Ticket fechado.")
 
     @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
     async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Fecho cancelado.", view=None)
         self.stop()
 
-class TicketOpcoesView(discord.ui.View):
+
+class TicketOpcoesView(VexView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -503,7 +803,7 @@ class TicketOpcoesView(discord.ui.View):
             await interaction.response.send_message("Não tens permissão para fechar este ticket.", ephemeral=True)
             return
         await interaction.response.send_message(
-            "Queres fechar este ticket? O canal e as mensagens serão apagados.",
+            "Queres fechar este ticket? A conversa e os anexos serão guardados no registo privado da equipa antes de o canal ser apagado.",
             view=ConfirmarFechoView(interaction.user.id), ephemeral=True,
         )
 
@@ -541,9 +841,9 @@ async def abrir_ticket(interaction: discord.Interaction, tipo: str, respostas=()
                 return
             overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-                cargo_staff: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                cargo_staff: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             }
             canal = await guild.create_text_channel(
                 f"{interaction.user.name}-{tipo}".lower(),
@@ -557,6 +857,7 @@ async def abrir_ticket(interaction: discord.Interaction, tipo: str, respostas=()
                 embed=embed, view=TicketOpcoesView(),
             )
         except discord.HTTPException:
+            app.logger.exception("Falhou a abertura do ticket do membro %s.", interaction.user.id)
             if canal is not None:
                 try:
                     await canal.delete(reason="Não foi possível publicar a mensagem inicial do ticket")
@@ -568,7 +869,7 @@ async def abrir_ticket(interaction: discord.Interaction, tipo: str, respostas=()
 
 # ── Formulários e painel de tickets ──
 # Recolhe dados para otimização e reotimização. Os tickets de dúvidas abrem diretamente.
-class FormularioTicket(discord.ui.Modal):
+class FormularioTicket(VexModal):
     def __init__(self, tipo: str):
         titulo = "Adquirir Otimização" if tipo == "adquirir" else "Reotimizar"
         super().__init__(title=titulo)
@@ -624,7 +925,7 @@ DIAGNOSTICOS = {
 }
 
 
-class AbrirDiagnosticoView(discord.ui.View):
+class AbrirDiagnosticoView(VexView):
     def __init__(self, respostas):
         super().__init__(timeout=900)
         self.respostas = respostas
@@ -638,7 +939,7 @@ class AbrirDiagnosticoView(discord.ui.View):
         await abrir_ticket(interaction, "diagnostico", self.respostas)
 
 
-class FormularioDiagnostico(discord.ui.Modal):
+class FormularioDiagnostico(VexModal):
     jogo = discord.ui.TextInput(label="Jogo", max_length=80)
     grafica = discord.ui.TextInput(label="Placa gráfica", max_length=80)
     processador = discord.ui.TextInput(label="Processador", max_length=80)
@@ -689,7 +990,7 @@ class EscolherProblemaSelect(discord.ui.Select):
         await interaction.response.send_modal(FormularioDiagnostico(self.values[0]))
 
 
-class EscolherProblemaView(discord.ui.View):
+class EscolherProblemaView(VexView):
     def __init__(self):
         super().__init__(timeout=300)
         self.add_item(EscolherProblemaSelect())
@@ -699,16 +1000,35 @@ class PainelTicketsSelect(discord.ui.Select):
     def __init__(self):
         options = [
             discord.SelectOption(
+                label="Adquirir Otimização",
+                description="Quero comprar uma otimização para o meu PC",
+                value="adquirir",
+                emoji=EMOJIS_TICKET["adquirir"],
+            ),
+            discord.SelectOption(
+                label="Dúvidas",
+                description="Perguntas sobre serviços, preços e marcações",
+                value="duvidas",
+                emoji=EMOJIS_TICKET["duvidas"],
+            ),
+            discord.SelectOption(
+                label="Reotimizar",
+                description="Já sou cliente e quero uma nova otimização",
+                value="reotimizar",
+                emoji=EMOJIS_TICKET["reotimizar"],
+            ),
+            discord.SelectOption(
                 label="Diagnóstico gratuito",
-                description="Recebe sugestões para o teu PC ou jogo",
+                description="Quero ajuda inicial com um problema no PC",
                 value="diagnostico",
                 emoji="🖥️",
             ),
-            discord.SelectOption(label="Adquirir Otimização", description="Pede uma otimização para o teu PC", value="adquirir", emoji=EMOJIS_TICKET["adquirir"]),
-            discord.SelectOption(label="Dúvidas", description="Suporte geral", value="duvidas", emoji=EMOJIS_TICKET["duvidas"]),
-            discord.SelectOption(label="Reotimizar", description="Pede uma nova otimização", value="reotimizar", emoji=EMOJIS_TICKET["reotimizar"]),
         ]
-        super().__init__(placeholder="Escolhe o tipo de atendimento", options=options, custom_id="painel_tickets_select")
+        super().__init__(
+            placeholder="Escolhe o tipo de atendimento",
+            options=options,
+            custom_id="painel_tickets_select",
+        )
 
     async def callback(self, interaction: discord.Interaction):
         tipo = self.values[0]
@@ -723,14 +1043,14 @@ class PainelTicketsSelect(discord.ui.Select):
         else:
             await interaction.response.send_modal(FormularioTicket(tipo))
 
-class PainelTicketsView(discord.ui.View):
+class PainelTicketsView(VexView):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(PainelTicketsSelect())
 
 # ── Botão de verificação ──
 # Abre a página Web onde o membro inicia a autorização da conta Discord.
-class VerifyAuthView(discord.ui.View):
+class VerifyAuthView(VexView):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(label="Verificar conta", url=get_verification_url(), style=discord.ButtonStyle.link, emoji="✅"))
@@ -748,8 +1068,27 @@ class MeuBot(commands.Bot):
         self.add_view(PainelTicketsView())
         self.add_view(TicketOpcoesView())
         await self.tree.sync()
+        if not manter_voz_247.is_running():
+            manter_voz_247.start()
 
 bot = MeuBot()
+
+
+@bot.tree.error
+async def tratar_erro_comando(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await comunicar_erro(interaction, "Este comando é reservado à administração.")
+        return
+    if isinstance(error, app_commands.NoPrivateMessage):
+        await comunicar_erro(interaction, "Usa este comando dentro do servidor.")
+        return
+    original = getattr(error, "original", error)
+    app.logger.error(
+        "Falha no comando %s.", getattr(interaction.command, "name", "?"),
+        exc_info=(type(original), original, original.__traceback__),
+    )
+    await comunicar_erro(interaction, "Não foi possível concluir o comando. Consulta a consola ou contacta a equipa.")
+
 
 @bot.event
 async def on_ready():
@@ -770,11 +1109,28 @@ async def on_voice_state_update(member, before, after):
 # Publica painéis e avisos e dá à equipa acesso ao histórico de fechos.
 @bot.tree.command(name="setup_tickets", description="Cria o painel de tickets")
 @app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     embed_painel = discord.Embed(
         title="<:Vex:1550695876769489088> Vex Otimização — Tickets",
-        description="Escolhe abaixo a opção que corresponde ao teu pedido.",
+        description=(
+            "Escolhe abaixo a opção que corresponde ao teu pedido.\n\n"
+            "```ansi\n"
+            "\u001b[1;36mC:\\VEX> PAGAMENTOS E CONTACTO\u001b[0m\n\n"
+            "\u001b[1;36m[DÚVIDAS E TERMOS]\u001b[0m\n"
+            "Consulta o canal \u001b[1;33m#termos\u001b[0m.\n\n"
+            "\u001b[1;36m[PAGAMENTOS]\u001b[0m\n"
+            "Abre um \u001b[1;33mticket\u001b[0m para tratar do pagamento.\n\n"
+            "\u001b[1;36m[MÉTODOS DISPONÍVEIS]\u001b[0m\n"
+            "\u001b[1;32mPayPal\u001b[0m — Internacional.\n"
+            "\u001b[1;32mMB WAY\u001b[0m — Portugal.\n\n"
+            "\u001b[1;36m[PROBLEMAS COM O TICKET?]\u001b[0m\n"
+            "Envia mensagem privada ao \u001b[1;33m@away\u001b[0m.\n\n"
+            "\u001b[1;33mC:\\VEX> Confirma os dados antes de pagar.\u001b[0m\n"
+            "```"
+        ),
         color=discord.Color.dark_theme(),
     )
     if os.path.isfile(BANNER_PATH):
@@ -787,12 +1143,18 @@ async def setup_tickets(interaction: discord.Interaction):
 
 @bot.tree.command(name="aviso", description="Envia uma mensagem para o canal atual usando o bot")
 @app_commands.default_permissions(administrator=True)
-async def aviso(interaction: discord.Interaction, mensagem: str):
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(mensagem='Mensagem a publicar no canal atual')
+async def aviso(interaction: discord.Interaction, mensagem: app_commands.Range[str, 1, 2000]):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     await interaction.channel.send(mensagem)
-    await interaction.response.send_message("Aviso enviado com sucesso!", ephemeral=True)
+    await interaction.followup.send("Aviso enviado com sucesso!", ephemeral=True)
 
 @bot.tree.command(name="setup_verify", description="Cria a mensagem de verificação (OAuth2)")
 @app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
 async def setup_verify(interaction: discord.Interaction):
     if not CLIENT_ID or not CLIENT_SECRET or not get_verification_url():
         await interaction.response.send_message(
@@ -813,6 +1175,8 @@ async def setup_verify(interaction: discord.Interaction):
 # Adiciona membros com autorização guardada e mostra as estatísticas de verificação.
 @bot.tree.command(name="pull_all", description="Adiciona os membros com autorização guardada")
 @app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
 async def pull_all(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     tokens = get_all_tokens()
@@ -824,22 +1188,32 @@ async def pull_all(interaction: discord.Interaction):
     bot_token = os.getenv("DISCORD_TOKEN")
     guild_id = interaction.guild_id
 
-    for user_id, access_token, refresh_token, expires_at in tokens:
+    prazo = time.monotonic() + 12 * 60
+    por_processar = 0
+    for index, (user_id, access_token, refresh_token, expires_at) in enumerate(tokens):
+        if time.monotonic() >= prazo:
+            por_processar = len(tokens) - index
+            break
         if time.time() >= expires_at:
-            access_token = refresh_access_token(user_id, refresh_token)
+            access_token = await asyncio.to_thread(refresh_access_token, user_id, refresh_token)
             if not access_token:
                 falhas += 1
                 continue
-        status = add_user_to_guild(access_token, guild_id, user_id, bot_token)
+        status = await asyncio.to_thread(add_user_to_guild, access_token, guild_id, user_id, bot_token)
         if status in (201, 200): sucessos += 1
         elif status == 204: ja_no_servidor += 1
         else: falhas += 1
         await asyncio.sleep(1)
 
-    await interaction.followup.send(f"📊 **Resultado:** Sucessos: {sucessos} | Já no Servidor: {ja_no_servidor} | Falhas: {falhas}", ephemeral=True)
+    resultado = f"📊 **Resultado:** Sucessos: {sucessos} | Já no servidor: {ja_no_servidor} | Falhas: {falhas}"
+    if por_processar:
+        resultado += f"\nPor processar: {por_processar}. Volta a executar o comando para continuar."
+    await interaction.followup.send(resultado, ephemeral=True)
 
 @bot.tree.command(name="pull_user", description="Adiciona um utilizador autorizado pelo respetivo ID")
 @app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
 async def pull_user(interaction: discord.Interaction, user_id: str):
     await interaction.response.defer(ephemeral=True)
     row = get_user_token(user_id)
@@ -849,13 +1223,13 @@ async def pull_user(interaction: discord.Interaction, user_id: str):
 
     _, access_token, refresh_token, expires_at = row
     if time.time() >= expires_at:
-        access_token = refresh_access_token(user_id, refresh_token)
+        access_token = await asyncio.to_thread(refresh_access_token, user_id, refresh_token)
         if not access_token:
             await interaction.followup.send("❌ O token expirou e não foi possível renová-lo.", ephemeral=True)
             return
 
     bot_token = os.getenv("DISCORD_TOKEN")
-    status = add_user_to_guild(access_token, interaction.guild_id, user_id, bot_token)
+    status = await asyncio.to_thread(add_user_to_guild, access_token, interaction.guild_id, user_id, bot_token)
 
     if status in (201, 200):
         await interaction.followup.send(f"✅ Utilizador `{user_id}` adicionado com sucesso!", ephemeral=True)
@@ -866,6 +1240,8 @@ async def pull_user(interaction: discord.Interaction, user_id: str):
 
 @bot.tree.command(name="auth_stats", description="Mostra o número total de utilizadores autorizados na base de dados")
 @app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
 async def auth_stats(interaction: discord.Interaction):
     tokens = get_all_tokens()
     await interaction.response.send_message(
@@ -879,20 +1255,29 @@ async def ticket_historico(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
         await interaction.response.send_message("Este comando é reservado à equipa.", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True, thinking=True)
     with sqlite3.connect(DB_FILE) as conn:
         rows = conn.execute(
-            "SELECT channel_name, closed_by, closed_at, status FROM ticket_closures "
-            "WHERE guild_id = ? ORDER BY closed_at DESC LIMIT 10",
+            "SELECT c.channel_name, c.closed_by, c.closed_at, c.status, a.log_url "
+            "FROM ticket_closures c LEFT JOIN ticket_archives a ON c.channel_id = a.channel_id "
+            "WHERE c.guild_id = ? ORDER BY c.closed_at DESC LIMIT 10",
             (str(interaction.guild_id),),
         ).fetchall()
     lines = [
-        f"`{discord.utils.escape_markdown(name[:70])}` · <@{member_id}> · <t:{closed_at}:f> · {status}"
-        for name, member_id, closed_at, status in rows
+        f"**{discord.utils.escape_markdown(name[:60])}** · <@{member_id}>\n"
+        f"<t:{closed_at}:f> · {status}"
+        + (f" · [Conversa]({log_url})" if log_url else "")
+        for name, member_id, closed_at, status, log_url in rows
     ]
-    await interaction.response.send_message(
-        "\n".join(lines) if lines else "Ainda não há registos de fecho.",
-        ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+    embed = discord.Embed(
+        title="Histórico de tickets",
+        description="\n\n".join(lines) if lines else "Ainda não há registos de fecho.",
+        color=discord.Color.blurple(),
     )
+    await interaction.followup.send(
+        embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+    )
+
 
 # ── Arranque da aplicação ──
 # Inicia o servidor Web e liga o bot ao Discord com o token configurado.
